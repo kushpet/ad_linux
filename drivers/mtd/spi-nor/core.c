@@ -2393,7 +2393,36 @@ static const struct flash_info *spi_nor_read_id(struct spi_nor *nor)
 			if (id[0] == CFI_MFR_MICRON || id[0] == CFI_MFR_ST)
 				dev_info(nor->dev, "SPI-NOR-UniqueID %*phN\n",
 					 SPI_NOR_MAX_EDID_LEN - info->id_len, &id[info->id_len]);
-			return info;
+		   	if (id[0] == CFI_MFR_WINBND) {
+		       	u8 uid[8] = { 0 };
+
+		       	if (nor->spimem) {
+			   	struct spi_mem_op op =
+			       	SPI_MEM_OP(SPI_MEM_OP_CMD(0x4b, 1),
+				          	SPI_MEM_OP_ADDR(32, 0, 1),   /* 4 dummy bytes */
+				          	SPI_MEM_OP_NO_DUMMY,
+				          	SPI_MEM_OP_DATA_IN(sizeof(uid), uid, 1));
+
+			   		if (!spi_mem_exec_op(nor->spimem, &op))
+			       		dev_info(nor->dev, "SPI-NOR-UniqueID %*phN\n",
+				        		(int)sizeof(uid), uid);
+		       	} else if (nor->controller_ops && nor->controller_ops->read_reg) {
+			   		/* Старый путь через read_reg: посылаем 0x4B + 4 dummy + 8 байт */
+			   		u8 cmd_dummy[5] = { 0x4b, 0, 0, 0, 0 };
+
+			   		/* 1) отправить команду + 4 dummy как write_reg, если нужно */
+			   		if (!nor->controller_ops->write_reg ||
+			       		!nor->controller_ops->write_reg(nor, cmd_dummy[0],
+				                               &cmd_dummy[1], 4)) {
+			       		/* 2) прочитать 8 байт данных */
+			       		if (!nor->controller_ops->read_reg(nor, 0x4b,
+				                                  uid, sizeof(uid)))
+				   			dev_info(nor->dev, "SPI-NOR-UniqueID %*phN\n",
+				            		(int)sizeof(uid), uid);
+					}
+		    		}
+			}			
+		   	return info;
 		}
 	}
 

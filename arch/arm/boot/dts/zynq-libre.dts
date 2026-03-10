@@ -35,10 +35,16 @@
 	
 	leds {
 		compatible = "gpio-leds";
-		led0 {
-			label = "led0:green";
-			gpios = <&gpio0 15 0>;
-			linux,default-trigger = "heartbeat";
+
+		pl_led0 {
+		    label = "pl_led0:blue";
+		    gpios = <&gpio0 71 0>;   /* EMIO GPIO_0[17] -> J20 via pl_led0 */		    
+		};
+
+		pl_led1 {
+		    label = "pl_led1:blue";
+		    gpios = <&gpio0 72 0>;   /* EMIO GPIO_0[18] -> H20 via pl_led1 */
+		    linux,default-trigger = "heartbeat";
 		};
 	};
 
