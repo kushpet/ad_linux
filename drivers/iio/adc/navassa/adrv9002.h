@@ -19,6 +19,7 @@
 #include "adi_common_log.h"
 #include "adi_adrv9001_user.h"
 #include "adi_adrv9001_cals_types.h"
+#include "adi_adrv9001_dpd_types.h"
 #include "adi_adrv9001_fh_types.h"
 #include "adi_adrv9001_radio_types.h"
 #include "adi_adrv9001_rx_gaincontrol_types.h"
@@ -36,6 +37,8 @@ struct iio_chan_spec;
 #define ADRV9002_FH_BIN_ATTRS_CNT	(ADRV9002_FH_HOP_SIGNALS_NR * ADRV9002_FH_TABLES_NR)
 #define ADRV9002_RX_MIN_GAIN_IDX	ADI_ADRV9001_RX_GAIN_INDEX_MIN
 #define ADRV9002_RX_MAX_GAIN_IDX	ADI_ADRV9001_RX_GAIN_INDEX_MAX
+#define ADRV9002_DPD_MAX_REGIONS	8
+#define ADRV9002_DPD_FH_MAX_REGIONS	(ADRV9002_DPD_MAX_REGIONS - 1)
 
 enum {
 	ADRV9002_CHANN_1,
@@ -89,6 +92,7 @@ enum adrv9002_rx_ext_info {
 	RX_ADC_SWITCH,
 	RX_BBDC,
 	RX_BBDC_LOOP_GAIN,
+	RX_INTERFACE_GAIN_AVAIL,
 };
 
 enum adrv9002_tx_ext_info {
@@ -147,15 +151,20 @@ struct adrv9002_clock {
 
 struct adrv9002_chan {
 	struct clk *clk;
+	struct gpio_desc *mux_ctl;
+	struct gpio_desc *mux_ctl_2;
 	struct adrv9002_ext_lo *ext_lo;
+	u64 carrier;
 	/*
 	 * These values are in nanoseconds. They need to be converted with
 	 * @adrv9002_chan_ns_to_en_delay() before passing them to the API.
 	 */
 	struct adi_adrv9001_ChannelEnablementDelays en_delays_ns;
 	unsigned long rate;
+	adi_adrv9001_InitCalibrations_e lo_cals;
 	adi_adrv9001_ChannelState_e cached_state;
 	adi_common_ChannelNumber_e number;
+	adi_adrv9001_LoSel_e lo;
 	adi_common_Port_e port;
 	u32 power;
 	int nco_freq;
@@ -177,8 +186,12 @@ struct adrv9002_rx_chan {
 
 struct adrv9002_tx_chan {
 	struct adrv9002_chan channel;
+	struct adi_adrv9001_DpdInitCfg *dpd_init;
+	struct adi_adrv9001_DpdCfg *dpd;
 	struct adi_adrv9001_TxAttenuationPinControlCfg *pin_cfg;
 	u8 dac_boost_en;
+	u8 elb_en;
+	u8 ext_path_calib;
 #ifdef CONFIG_DEBUG_FS
 	struct adi_adrv9001_TxSsiTestModeCfg ssi_test;
 	u8 loopback;
@@ -219,6 +232,7 @@ struct adrv9002_rf_phy {
 	struct iio_dev			*indio_dev;
 	struct gpio_desc		*reset_gpio;
 	struct gpio_desc		*ssi_sync;
+	struct iio_chan_spec		*iio_chan;
 	/* Protect against concurrent accesses to the device */
 	struct mutex			lock;
 	struct clk			*clks[NUM_ADRV9002_CLKS];
@@ -243,6 +257,7 @@ struct adrv9002_rf_phy {
 	struct adi_adrv9001_Init	*curr_profile;
 	struct adi_adrv9001_Init	profile;
 	struct adi_adrv9001_InitCals	init_cals;
+	bool				run_cals;
 	u32				n_clks;
 	int				ngpios;
 	u8				rx2tx2;
@@ -292,7 +307,7 @@ int adrv9002_axi_interface_set(const struct adrv9002_rf_phy *phy, const u8 n_lan
 			       const bool cmos_ddr, const int channel, const bool tx);
 int adrv9002_axi_intf_tune(const struct adrv9002_rf_phy *phy, const bool tx, const int chann,
 			   u8 *clk_delay, u8 *data_delay);
-void adrv9002_axi_interface_enable(struct adrv9002_rf_phy *phy, const int chan, const bool tx,
+void adrv9002_axi_interface_enable(const struct adrv9002_rf_phy *phy, const int chan, const bool tx,
 				   const bool en);
 int adrv9002_axi_tx_test_pattern_cfg(struct adrv9002_rf_phy *phy, const int channel,
 				     const adi_adrv9001_SsiTestModeData_e data);

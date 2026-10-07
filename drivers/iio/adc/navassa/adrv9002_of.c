@@ -11,8 +11,10 @@
 #include <linux/spi/spi.h>
 
 #include "adrv9002.h"
+#include "adi_adrv9001_dpd_types.h"
 #include "adi_adrv9001_gpio_types.h"
 #include "adi_adrv9001_fh_types.h"
+#include "adi_adrv9001_radio.h"
 
 #define ADRV9002_OF_U32_GET_VALIDATE(dev, node, key, def, min, max,		\
 				     val, mandatory) ({				\
@@ -462,6 +464,217 @@ of_en_delay_put:
 	return ret;
 }
 
+static int adrv9002_parse_dpd_pre_calib(const struct adrv9002_rf_phy *phy,
+					const struct device_node *dpd, struct adrv9002_tx_chan *tx)
+{
+	u32 val;
+	int ret;
+
+#define OF_ADRV9002_DPD_INIT(key, def, min, max, val)	\
+	ADRV9002_OF_U32_GET_VALIDATE(&phy->spi->dev, dpd, key, def, min, max, val, false)
+
+	/* values are scaled by 1000 for fractional values */
+	ret = OF_ADRV9002_DPD_INIT("adi,pre-lut", 2000, 1000, 3750, val);
+	if (ret)
+		return ret;
+
+	/* U2.2 value */
+	tx->dpd_init->preLutScale = DIV_ROUND_CLOSEST(val << 2, 1000);
+
+	ret = OF_ADRV9002_DPD_INIT("adi,lut-size", ADI_ADRV9001_DPDLUTSIZE_512,
+				   ADI_ADRV9001_DPDLUTSIZE_256, ADI_ADRV9001_DPDLUTSIZE_512,
+				   tx->dpd_init->lutSize);
+	if (ret)
+		return ret;
+
+	tx->dpd_init->clgcEnable = of_property_read_bool(dpd, "adi,close-loop-gain");
+
+	ret = of_property_count_u32_elems(dpd, "adi,model-tap-orders");
+	if (ret < 0)
+		return 0;
+	if (ret != ARRAY_SIZE(tx->dpd_init->modelOrdersForEachTap)) {
+		dev_err(&phy->spi->dev, "Invalid number of taps(%u) for tx(%u)\n", ret,
+			tx->channel.number);
+		return -EINVAL;
+	}
+
+	tx->dpd_init->changeModelTapOrders = true;
+	return of_property_read_u32_array(dpd, "adi,model-tap-orders",
+					  tx->dpd_init->modelOrdersForEachTap,
+					  ARRAY_SIZE(tx->dpd_init->modelOrdersForEachTap));
+}
+
+static int adrv9002_parse_dpd_config(const struct adrv9002_rf_phy *phy,
+				     const struct device_node *dpd, struct adrv9002_tx_chan *tx)
+{
+	u64 gain_target;
+	u32 val;
+	int ret;
+
+#define OF_ADRV9002_DPD(key, def, min, max, val)	\
+	ADRV9002_OF_U32_GET_VALIDATE(&phy->spi->dev, dpd, key, def, min, max, val, false)
+
+	ret = OF_ADRV9002_DPD("adi,samples-number", 4096, 1024, 4096, tx->dpd->numberOfSamples);
+	if (ret)
+		return ret;
+
+	ret = OF_ADRV9002_DPD("adi,additional-power-scale", 4, 0, UINT_MAX,
+			      tx->dpd->additionalPowerScale);
+	if (ret)
+		return ret;
+
+	/*
+	 * Ideally, the next four properties would be given in dBFS but since we do not
+	 * have floating point in the kernel, deriving the raw values would not be possible
+	 * (without huge approximations).
+	 * Some help can be given on how to get here though... Assuming we know the dBFS value:
+	 *	dBFS = 10 * log(x), where x = signal / signal_peak
+	 *
+	 *	x = 10^(dBFS/10)
+	 *	raw = x * 2^30 (as these are U2.30 values)
+	 */
+	ret = OF_ADRV9002_DPD("adi,rxtx-normalization-lower-threshold", 3395469, 0, 1 << 30,
+			      tx->dpd->rxTxNormalizationLowerThreshold);
+	if (ret)
+		return ret;
+
+	ret = OF_ADRV9002_DPD("adi,rxtx-normalization-upper-threshold", 33954696, 0, 1 << 30,
+			      tx->dpd->rxTxNormalizationUpperThreshold);
+	if (ret)
+		return ret;
+
+	/*
+	 * The next two values is the same story as the above with the difference that the
+	 * values are U1.31.
+	 */
+	ret = OF_ADRV9002_DPD("adi,detection-power-threshold", 0, 0, 1 << 31,
+			      tx->dpd->detectionPowerThreshold);
+	if (ret)
+		return ret;
+
+	ret = OF_ADRV9002_DPD("adi,detection-peak-threshold", 0, 0, 1 << 31,
+			      tx->dpd->detectionPeakThreshold);
+	if (ret)
+		return ret;
+
+	ret = OF_ADRV9002_DPD("adi,counts-less-power-threshold", 4096, 0, USHRT_MAX,
+			      tx->dpd->detectionPowerThreshold);
+	if (ret)
+		return ret;
+
+	ret = OF_ADRV9002_DPD("adi,counts-greater-peak-threshold", 0, 0, USHRT_MAX,
+			      tx->dpd->detectionPeakThreshold);
+	if (ret)
+		return ret;
+
+	/* U1.31 value. Value given in dts with micro granularity */
+	ret = OF_ADRV9002_DPD("adi,time-filter-coefficient", 0, 0, 1000000, val);
+	if (ret)
+		return ret;
+
+	tx->dpd->timeFilterCoefficient = DIV_ROUND_CLOSEST_ULL((u64)val << 31, 1000000);
+	/*
+	 * for the max value we get 2147483648 but for the API the max is 2147483647
+	 * (which also gives 1.0 when doing the reverse math) so decrement one in that case.
+	 * Yeahh, it does look bad...
+	 */
+	if (tx->dpd->timeFilterCoefficient == 1 << 31)
+		tx->dpd->timeFilterCoefficient--;
+
+	tx->dpd->clgcLoopOpen = of_property_read_bool(dpd, "adi,clgc-open-loop");
+	tx->dpd->immediateLutSwitching = of_property_read_bool(dpd, "adi,immediate_lut_switch");
+
+	ret = of_property_read_u64(dpd, "adi,clgc-gain-target-mdB", &gain_target);
+	if (!ret) {
+		if ((s64)gain_target < INT_MIN * 10LL || (s64)gain_target > INT_MAX * 10LL) {
+			dev_err(&phy->spi->dev, "Invalid value(%lld) for adi,clgc-gain-target-mdB\n",
+				gain_target);
+			return -EINVAL;
+		}
+
+		tx->dpd->clgcGainTarget_HundredthdB = div_s64(gain_target, 10);
+	}
+
+	/* U1.31 value. Value given in dts with micro granularity */
+	ret = OF_ADRV9002_DPD("adi,clg-filter-alpha", 0, 0, 1000000, val);
+	if (ret)
+		return ret;
+
+	tx->dpd->clgcFilterAlpha = DIV_ROUND_CLOSEST_ULL((u64)val << 31, 1000000);
+
+	return OF_ADRV9002_DPD("adi,capture-delay-us", 0, 0, 1000000, val);
+}
+
+static int adrv9002_parse_dpd(const struct adrv9002_rf_phy *phy,
+			      const struct device_node *node, struct adrv9002_tx_chan *tx)
+{
+	struct device_node *dpd;
+	int ret;
+
+	if (!of_property_read_bool(node, "adi,dpd"))
+		return 0;
+
+	tx->dpd_init = devm_kzalloc(&phy->spi->dev, sizeof(*tx->dpd_init), GFP_KERNEL);
+	if (!tx->dpd_init)
+		return -ENOMEM;
+
+	tx->dpd = devm_kzalloc(&phy->spi->dev, sizeof(*tx->dpd), GFP_KERNEL);
+	if (!tx->dpd)
+		return -ENOMEM;
+
+	tx->dpd_init->enable = true;
+	/* not configurable */
+	tx->dpd_init->amplifierType = ADI_ADRV9001_DPDAMPLIFIER_DEFAULT;
+	tx->dpd_init->model = ADI_ADRV9001_DPDMODEL_4;
+
+	dpd = of_parse_phandle(node, "adi,dpd-config", 0);
+	if (!dpd) {
+		/* set default parameters */
+		tx->dpd_init->lutSize = ADI_ADRV9001_DPDLUTSIZE_512;
+		tx->dpd_init->preLutScale = 8;
+		tx->dpd->numberOfSamples = 4096;
+		tx->dpd->additionalPowerScale = 4;
+		/* -25dBFS*/
+		tx->dpd->rxTxNormalizationLowerThreshold = 3395470;
+		/* -15dBFS */
+		tx->dpd->rxTxNormalizationUpperThreshold = 33954698;
+		/* disable it */
+		tx->dpd->countsLessThanPowerThreshold = 4096;
+		/*
+		 * Should be set for FDD and in fact, TDD is only properly working
+		 * when this is enabled.
+		 */
+		tx->dpd->immediateLutSwitching = true;
+		return 0;
+	}
+
+	tx->ext_path_calib = of_property_read_bool(dpd, "adi,external-path-delay-calibrate");
+
+	ret = adrv9002_parse_dpd_pre_calib(phy, dpd, tx);
+	if (ret)
+		goto of_dpd_put;
+
+	ret = adrv9002_parse_dpd_config(phy, dpd, tx);
+of_dpd_put:
+	of_node_put(dpd);
+	return ret;
+}
+
+/* there's no optional variant for this, so we need to check for -ENOENT */
+static struct gpio_desc *devm_fwnode_gpiod_get_optional(struct device *dev,
+							struct device_node *node,
+							const char *con_id,
+							enum gpiod_flags flags, const char *label)
+{
+	struct gpio_desc *desc;
+
+	desc = devm_fwnode_gpiod_get(dev, of_fwnode_handle(node), con_id, flags, label);
+	if (IS_ERR(desc) && PTR_ERR(desc) == -ENOENT)
+		return NULL;
+
+	return desc;
+}
+
 static int adrv9002_parse_tx_pin_dt(const struct adrv9002_rf_phy *phy,
 				    struct device_node *node,
 				    struct adrv9002_tx_chan *tx)
@@ -504,6 +717,8 @@ of_pinctrl_put:
 static int adrv9002_parse_tx_dt(struct adrv9002_rf_phy *phy,
 				struct device_node *node, const int channel)
 {
+	const char *mux_label_2 = channel ? "tx2-mux-ctl2" : "tx1-mux-ctl2";
+	const char *mux_label = channel ? "tx2-mux-ctl" : "tx1-mux-ctl";
 	struct adrv9002_tx_chan *tx = &phy->tx_channels[channel];
 	int ret;
 
@@ -515,7 +730,33 @@ static int adrv9002_parse_tx_dt(struct adrv9002_rf_phy *phy,
 	if (of_property_read_bool(node, "adi,dac-full-scale-boost"))
 		tx->dac_boost_en = true;
 
+	ret = of_property_read_u64(node, "adi,carrier-hz", &tx->channel.carrier);
+	if (!ret) {
+		u64 min = ADI_ADRV9001_CARRIER_FREQUENCY_MIN_HZ;
+		u64 max = ADI_ADRV9001_CARRIER_FREQUENCY_MAX_HZ;
+
+		if (tx->channel.carrier < min || tx->channel.carrier > max) {
+			dev_err(&phy->spi->dev, "Invalid carrier(%llu) for TX%d\n",
+				tx->channel.carrier, channel + 1);
+			return -EINVAL;
+		}
+	}
+
 	ret = adrv9002_parse_en_delays(phy, node, &tx->channel);
+	if (ret)
+		return ret;
+
+	tx->channel.mux_ctl = devm_fwnode_gpiod_get_optional(&phy->spi->dev, node, "mux-ctl",
+							     GPIOD_OUT_HIGH, mux_label);
+	if (IS_ERR(tx->channel.mux_ctl))
+		return PTR_ERR(tx->channel.mux_ctl);
+
+	tx->channel.mux_ctl_2 = devm_fwnode_gpiod_get_optional(&phy->spi->dev, node, "mux-ctl2",
+							       GPIOD_OUT_HIGH, mux_label_2);
+	if (IS_ERR(tx->channel.mux_ctl_2))
+		return PTR_ERR(tx->channel.mux_ctl_2);
+
+	ret = adrv9002_parse_dpd(phy, node, tx);
 	if (ret)
 		return ret;
 
@@ -799,6 +1040,9 @@ static int adrv9002_parse_rx_dt(struct adrv9002_rf_phy *phy,
 				struct device_node *node,
 				const int channel)
 {
+	const char *rxb_mux_label = channel ? "rx2b-mux-ctl" : "rx1b-mux-ctl";
+	const char *mux_label = channel ? "rx2a-mux-ctl" : "rx1a-mux-ctl";
+	const char *gpio_label = channel ? "orx2" : "orx1";
 	struct adrv9002_rx_chan *rx = &phy->rx_channels[channel];
 	int ret;
 	u32 min_gain, max_gain;
@@ -814,6 +1058,18 @@ static int adrv9002_parse_rx_dt(struct adrv9002_rf_phy *phy,
 	ret = adrv9002_parse_en_delays(phy, node, &rx->channel);
 	if (ret)
 		return ret;
+
+	ret = of_property_read_u64(node, "adi,carrier-hz", &rx->channel.carrier);
+	if (!ret) {
+		u64 min = ADI_ADRV9001_CARRIER_FREQUENCY_MIN_HZ;
+		u64 max = ADI_ADRV9001_CARRIER_FREQUENCY_MAX_HZ;
+
+		if (rx->channel.carrier < min || rx->channel.carrier > max) {
+			dev_err(&phy->spi->dev, "Invalid carrier(%llu) for RX%d\n",
+				rx->channel.carrier, channel + 1);
+			return -EINVAL;
+		}
+	}
 
 	/* check min/max gain and assign to pinctrl and agc if there */
 #define ADRV9002_OF_RX_OPTIONAL(key, def, min, max, val)	\
@@ -840,15 +1096,20 @@ static int adrv9002_parse_rx_dt(struct adrv9002_rf_phy *phy,
 	}
 
 	/* there's no optional variant for this, so we need to check for -ENOENT */
-	rx->orx_gpio = devm_fwnode_get_index_gpiod_from_child(&phy->spi->dev, "orx", 0,
-							      of_fwnode_handle(node),
-							      GPIOD_OUT_LOW, NULL);
-	if (IS_ERR(rx->orx_gpio)) {
-		if (PTR_ERR(rx->orx_gpio) != -ENOENT)
-			return PTR_ERR(rx->orx_gpio);
+	rx->orx_gpio = devm_fwnode_gpiod_get_optional(&phy->spi->dev, node, "orx", GPIOD_OUT_LOW,
+						      gpio_label);
+	if (IS_ERR(rx->orx_gpio))
+		return PTR_ERR(rx->orx_gpio);
 
-		rx->orx_gpio = NULL;
-	}
+	rx->channel.mux_ctl = devm_fwnode_gpiod_get_optional(&phy->spi->dev, node, "mux-ctl",
+							     GPIOD_OUT_HIGH, mux_label);
+	if (IS_ERR(rx->channel.mux_ctl))
+		return PTR_ERR(rx->channel.mux_ctl);
+
+	rx->channel.mux_ctl_2 = devm_fwnode_gpiod_get_optional(&phy->spi->dev, node, "mux-ctl2",
+							       GPIOD_OUT_HIGH, rxb_mux_label);
+	if (IS_ERR(rx->channel.mux_ctl_2))
+		return PTR_ERR(rx->channel.mux_ctl_2);
 
 	return 0;
 }

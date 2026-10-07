@@ -664,9 +664,9 @@ static ssize_t axiadc_testmode_write(struct iio_dev *indio_dev,
 		}
 	}
 
-	mutex_lock(&indio_dev->mlock);
+	mutex_lock(&conv->lock);
 	ret = ad9467_testmode_set(indio_dev, chan->channel, mode);
-	mutex_unlock(&indio_dev->mlock);
+	mutex_unlock(&conv->lock);
 
 	return ret ? ret : len;
 }
@@ -992,10 +992,9 @@ static int ad9467_get_scale(struct axiadc_converter *conv, int *val, int *val2)
 		vref_mask = AD9467_REG_VREF_MASK;
 		break;
 	case CHIPID_AD9643:
-		vref_mask = AD9643_REG_VREF_MASK;
-		break;
 	case CHIPID_AD9250:
 	case CHIPID_AD9683:
+		vref_mask = AD9643_REG_VREF_MASK;
 		break;
 	case CHIPID_AD9265:
 		vref_mask = AD9265_REG_VREF_MASK;

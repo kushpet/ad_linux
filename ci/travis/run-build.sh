@@ -69,11 +69,11 @@ fi
 
 if [ "$ARCH" = "arm" ] ; then
 	if [ -z "$CROSS_COMPILE" ] ; then
-		CROSS_COMPILE=arm-linux-gnueabihf-
+		CROSS_COMPILE=arm-linux-gnueabi-
 		export CROSS_COMPILE
 	fi
 
-	APT_LIST="$APT_LIST gcc-arm-linux-gnueabihf"
+	APT_LIST="$APT_LIST gcc-arm-linux-gnueabi"
 fi
 
 apt_update_install() {
@@ -278,7 +278,14 @@ build_checkpatch() {
 	# install checkpatch dependencies
 	sudo pip install ply GitPython
 
-	__update_git_ref "${ref_branch}" "${ref_branch}"
+	# __update_git_ref() does a shallow fetch with depth=50 by default to speed things
+	# up. However that could be problematic if the branch in the PR diverged from
+	# master such that we cannot find a common ancestor. In that case, the job will
+	# timeout after 60min even if the branch is able to merge (even if diverged). We
+	# could do '$GIT_FETCH_DEPTH="disable"' before calling __update_git_ref() but that
+	# would slow things a lot. Instead, let's do a treeless fetch which get's the whole
+	# history while being much faster than a typical fetch.
+	git fetch --filter=tree:0 --no-tags ${ORIGIN} +refs/heads/${ref_branch}:${ref_branch}
 
 	scripts/checkpatch.pl --git "${ref_branch}.." \
 		--strict \
@@ -289,6 +296,68 @@ build_checkpatch() {
 		--ignore PARENTHESIS_ALIGNMENT \
 		--ignore CAMELCASE \
 		--ignore UNDOCUMENTED_DT_STRING
+}
+
+build_dt_binding_check() {
+	local ref_branch="$(get_ref_branch)"
+	local commit="$COMMIT"
+	local err=0
+
+	echo_green "Running dt_binding_check for commit range '$ref_branch..'"
+
+	if [ -z "$ref_branch" ] ; then
+		echo_red "Could not get a base_ref for checkpatch"
+		exit 1
+	fi
+
+	# install dt_binding_check dependencies
+	pip3 install git+https://github.com/devicetree-org/dt-schema.git@master
+
+	__update_git_ref "${ref_branch}" "${ref_branch}"
+
+	local files=$(git diff --name-only "$ref_branch..$commit")
+
+	while read file; do
+		case "$file" in
+		*.yaml)
+			local relative_yaml=${file#Documentation/devicetree/bindings/}
+
+			if [[ "$relative_yaml" = "$file" ]]; then
+				echo "$file not a devicetree binding, skip check..."
+			else
+				echo "Testing devicetree binding $file"
+
+				git checkout -q "$commit" "$file"
+
+				# The dt_binding_check rule won't exit with an error
+				# for schema errors, but will exit with an error for
+				# dts example errors.
+				#
+				# All schema files must be validated before exiting,
+				# so the script should not exit on error.
+				#
+				# Disable exit-on-error flag, check the exit code
+				# manually, and set err if the exit-code is non-zero,
+				# before enabling exit-on-error back.
+				set +e
+				error_txt=$(make dt_binding_check DT_CHECKER_FLAGS=-m DT_SCHEMA_FILES="$relative_yaml" 2>&1)
+				if [[ $? -ne 0 ]]; then
+					err=1
+				fi
+				set -e
+
+				echo "$error_txt"
+
+				# file name appears in output if it contains errors
+				if echo "$error_txt" | grep -qF "$file"; then
+					err=1
+				fi
+			fi
+			;;
+		esac
+	done <<< "$files"
+
+	return $err
 }
 
 build_dtb_build_test() {
@@ -436,7 +505,7 @@ __handle_sync_with_main() {
 
 build_sync_branches_with_main() {
 	GIT_FETCH_DEPTH=50
-	BRANCHES="adi-5.10.0 rpi-5.10.y"
+	BRANCHES="adi-5.15.0 rpi-5.15.y"
 
 	__update_git_ref "$MAIN_BRANCH" "$MAIN_BRANCH" || {
 		echo_red "Could not fetch branch '$MAIN_BRANCH'"
