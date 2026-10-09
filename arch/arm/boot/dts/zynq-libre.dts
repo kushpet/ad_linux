@@ -55,7 +55,7 @@
 
 		button {
 			interrupt-parent = <&gpio0>;
-			interrupts = <14 IRQ_TYPE_EDGE_FALLING>;
+			interrupts = <12 IRQ_TYPE_EDGE_FALLING>;	/* DFU_KEY (SW1) on MIO12 */
 			label = "Button";
 			linux,code = <BTN_MISC>;
 		};
