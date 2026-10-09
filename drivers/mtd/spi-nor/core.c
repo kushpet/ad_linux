@@ -608,7 +608,8 @@ int spi_nor_write_ear(struct spi_nor *nor, u32 addr)
 		code = SPINOR_OP_BRWR;
 	if (nor->jedec_id == CFI_MFR_ST ||
 	    nor->jedec_id == CFI_MFR_MACRONIX ||
-	    nor->jedec_id == CFI_MFR_PMC) {
+	    nor->jedec_id == CFI_MFR_PMC ||
+	    nor->jedec_id == CFI_MFR_WINBND) {
 		spi_nor_write_enable(nor);
 		code = SPINOR_OP_WREAR;
 	}
@@ -687,7 +688,8 @@ static int read_ear(struct spi_nor *nor, struct flash_info *info)
 	/* This is actually Micron */
 	else if (nor->jedec_id == CFI_MFR_ST ||
 		 nor->jedec_id == CFI_MFR_MACRONIX ||
-		 nor->jedec_id == CFI_MFR_PMC)
+		 nor->jedec_id == CFI_MFR_PMC ||
+		 nor->jedec_id == CFI_MFR_WINBND)	/* W25Q256: RDEAR 0xC8 */
 		code = SPINOR_OP_RDEAR;
 	else
 		return -EINVAL;
