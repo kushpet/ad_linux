@@ -19,8 +19,13 @@
 		reg = <0x00000000 0x40000000>;
 	};
 
+	/* Console is UART0 (MIO14-15); zynq.dtsi points serial0 at Pluto's UART1. */
+	aliases {
+		serial0 = &uart0;
+	};
+
 	chosen {
-		stdout-path = "/amba@0/uart@E0000000";
+		stdout-path = "serial0:115200n8";
 	};
 
 
@@ -82,6 +87,11 @@
 &uart0 {
         u-boot,dm-pre-reloc;
         status = "okay";
+};
+
+/* UART1 is not routed on LibreSDR (no MIO, not enabled in the PS7 config). */
+&uart1 {
+	status = "disabled";
 };
 
 &qspi {
