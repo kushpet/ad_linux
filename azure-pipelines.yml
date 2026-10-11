@@ -1,15 +1,15 @@
 variables:
-  isMain: $[eq(variables['Build.SourceBranch'], 'refs/heads/master')]
+  isMain: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
 
 trigger:
 - main
-- master
+- next_stable
 - staging/*
 - 20*
 
 pr:
 - main
-- master
+- next_stable
 - 20*
 
 pool:
@@ -76,10 +76,10 @@ jobs:
       ./ci/travis/run-build.sh
     displayName: 'Bindings Check Script'
 
-- job: check_is_new_adi_driver_dual_licensed
+- job: check_new_file_license
   condition: eq(variables['Build.Reason'], 'PullRequest')
   variables:
-    BUILD_TYPE: check_is_new_adi_driver_dual_licensed
+    BUILD_TYPE: check_new_file_license
     TARGET_BRANCH: $[ variables['System.PullRequest.TargetBranch'] ]
   steps:
   - checkout: self
@@ -119,6 +119,11 @@ jobs:
         CHECK_ALL_ADI_DRIVERS_HAVE_BEEN_BUILT: 1
       zynqmp_adi_default:
         DEFCONFIG: adi_zynqmp_defconfig
+        ARCH: arm64
+        IMAGE: Image
+        CHECK_ALL_ADI_DRIVERS_HAVE_BEEN_BUILT: 1
+      versal_adi_default:
+        DEFCONFIG: adi_versal_defconfig
         ARCH: arm64
         IMAGE: Image
         CHECK_ALL_ADI_DRIVERS_HAVE_BEEN_BUILT: 1

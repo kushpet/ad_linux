@@ -29,11 +29,6 @@
 #include <linux/iio/iio.h>
 #include <linux/iio/sysfs.h>
 
-/* 5.10 compatibility */
-#include <linux/slab.h>
-#define IIO_DMA_MINALIGN		ARCH_KMALLOC_MINALIGN
-/* end 5.10 compatibility */
-
 #define AD_PULSAR_REG_CONFIG		0x00
 
 #define AD7682_NUM_TEMP_CHANNELS	1
@@ -216,6 +211,15 @@ static const struct ad_pulsar_chip_info ad7699_chip_info = {
 	.cfg_register = true
 };
 
+static const struct ad_pulsar_chip_info ad7694_chip_info = {
+	.name = "ad7694",
+	.input_type = DIFFERENTIAL,
+	.max_rate = 250000,
+	.resolution = 16,
+	.num_channels = 1,
+	.sclk_rate = 40000000
+};
+
 static const struct ad_pulsar_chip_info ad7693_chip_info = {
 	.name = "ad7693",
 	.input_type = DIFFERENTIAL,
@@ -285,6 +289,24 @@ static const struct ad_pulsar_chip_info ad7685_chip_info = {
 	.name = "ad7685",
 	.input_type = SINGLE_ENDED,
 	.max_rate = 250000,
+	.resolution = 16,
+	.num_channels = 1,
+	.sclk_rate = 40000000
+};
+
+static const struct ad_pulsar_chip_info ad7684_chip_info = {
+	.name = "ad7684",
+	.input_type = DIFFERENTIAL,
+	.max_rate = 100000,
+	.resolution = 16,
+	.num_channels = 1,
+	.sclk_rate = 40000000
+};
+
+static const struct ad_pulsar_chip_info ad7683_chip_info = {
+	.name = "ad7683",
+	.input_type = SINGLE_ENDED,
+	.max_rate = 100000,
 	.resolution = 16,
 	.num_channels = 1,
 	.sclk_rate = 40000000
@@ -401,24 +423,47 @@ static int ad_pulsar_reg_access(struct iio_dev *indio_dev, unsigned int reg,
 
 static int ad_pulsar_set_samp_freq(struct ad_pulsar_adc *adc, int freq)
 {
-	unsigned long long target, ref_clk_period_ps;
+	unsigned long long ref_clk_period_ns;
 	struct pwm_state cnv_state;
 	int ret;
+	u32 rem;
 
-	freq = clamp(freq, 0, adc->info->max_rate);
-	target = DIV_ROUND_CLOSEST_ULL(adc->ref_clk_rate, freq);
-	ref_clk_period_ps = DIV_ROUND_CLOSEST_ULL(1000000000000,
-						  adc->ref_clk_rate);
-	cnv_state.period = ref_clk_period_ps * target;
-	cnv_state.duty_cycle = ref_clk_period_ps;
-	cnv_state.phase = ref_clk_period_ps;
-	cnv_state.time_unit = PWM_UNIT_PSEC;
-	cnv_state.enabled = true;
+	/*
+	 * The objective here is to configure the PWM such that we don't have
+	 * more than $freq periods per second and duty_cycle and phase should be
+	 * their minimal positive value.
+	 *
+	 * When a period P (measured in ns) is passed to pwm_apply_state(), the
+	 * actually implemented period is:
+	 *
+	 * 	round_down(P * R / NSEC_PER_SEC) / R
+	 *
+	 * (measured in s) with R = adc->ref_clk_rate. We want
+	 *
+	 * 	  round_down(P * R / NSEC_PER_SEC) / R ≥ 1 / freq
+	 *	⟺ round_down(P * R / NSEC_PER_SEC) ≥ R / freq
+	 *	⟺ P * R / NSEC_PER_SEC ≥ round_up(R / freq)
+	 *	⟺ P ≥ round_up(R / freq) * NSEC_PER_SEC / R
+	 */
+	freq = clamp(freq, 1, adc->info->max_rate);
+	ref_clk_period_ns = DIV_ROUND_UP(NSEC_PER_SEC, adc->ref_clk_rate);
+
+	cnv_state = (struct pwm_state){
+		.duty_cycle = ref_clk_period_ns,
+		.phase = ref_clk_period_ns,
+		.enabled = true,
+	};
+
+	cnv_state.period = div_u64_rem((u64)DIV_ROUND_UP(adc->ref_clk_rate, freq) * NSEC_PER_SEC,
+				       adc->ref_clk_rate, &rem);
+	if (rem)
+		cnv_state.period += 1;
+
 	ret = pwm_apply_state(adc->cnv, &cnv_state);
 	if (ret)
 		return ret;
 
-	adc->samp_freq = DIV_ROUND_CLOSEST_ULL(adc->ref_clk_rate, target);
+	adc->samp_freq = freq;
 
 	return ret;
 }
@@ -480,7 +525,7 @@ static int ad_pulsar_read_raw(struct iio_dev *indio_dev,
 		if (ret)
 			return ret;
 
-		if (chan->differential)
+		if (chan->scan_type.sign == 's')
 			*val = sign_extend32(*val, adc->info->resolution - 1);
 
 		return IIO_VAL_INT;
@@ -495,7 +540,14 @@ static int ad_pulsar_read_raw(struct iio_dev *indio_dev,
 			if (ret < 0)
 				return ret;
 			*val = ret / 1000;
-			*val2 = adc->info->resolution;
+			/* When the channel is bipolar, one of the precision
+			 * bits accounts for the sign and we end up with one
+			 * less bit to express voltage magnitude.
+			 */
+			if (chan->scan_type.sign == 's')
+				*val2 = adc->info->resolution - 1;
+			else
+				*val2 = adc->info->resolution;
 
 			return IIO_VAL_FRACTIONAL_LOG2;
 		case IIO_TEMP:
@@ -668,17 +720,6 @@ static int ad_pulsar_buffer_postdisable(struct iio_dev *indio_dev)
 	return ad_pulsar_reg_write(adc, AD7682_REG_CONFIG, AD7682_DISABLE_SEQ);
 }
 
-static int ad_pulsar_dma_submit(struct iio_dma_buffer_queue *queue,
-				struct iio_dma_buffer_block *block)
-{
-	return iio_dmaengine_buffer_submit_block(queue, block, DMA_DEV_TO_MEM);
-}
-
-static const struct iio_dma_buffer_ops ad_pulsar_dma_buffer_ops = {
-	.submit = ad_pulsar_dma_submit,
-	.abort = iio_dmaengine_buffer_abort,
-};
-
 static const struct iio_buffer_setup_ops ad_pulsar_buffer_ops = {
 	.preenable = &ad_pulsar_buffer_preenable,
 	.postdisable = &ad_pulsar_buffer_postdisable,
@@ -823,7 +864,6 @@ static void ad_pulsar_clk_disable(void *data)
 static int ad_pulsar_probe(struct spi_device *spi)
 {
 	struct ad_pulsar_adc *adc;
-	struct iio_buffer *buffer;
 	struct iio_dev *indio_dev;
 	struct clk *ref_clk;
 	int ret;
@@ -891,13 +931,11 @@ static int ad_pulsar_probe(struct spi_device *spi)
 	indio_dev->modes = INDIO_BUFFER_HARDWARE | INDIO_DIRECT_MODE;
 	indio_dev->setup_ops = &ad_pulsar_buffer_ops;
 
-	buffer = devm_iio_dmaengine_buffer_alloc(indio_dev->dev.parent, "rx",
-						 &ad_pulsar_dma_buffer_ops,
-						 indio_dev);
-	if (IS_ERR(buffer))
-		return PTR_ERR(buffer);
-
-	iio_device_attach_buffer(indio_dev, buffer);
+	ret = devm_iio_dmaengine_buffer_setup(indio_dev->dev.parent,
+					      indio_dev, "rx",
+					      IIO_BUFFER_DIRECTION_IN);
+	if (ret)
+		return ret;
 
 	ret = ad_pulsar_set_samp_freq(adc, adc->info->max_rate);
 	if (ret)
@@ -917,6 +955,7 @@ static const struct of_device_id ad_pulsar_of_match[] = {
 	{ .compatible = "adi,pulsar,ad7946", .data = &ad7946_chip_info },
 	{ .compatible = "adi,pulsar,ad7942", .data = &ad7942_chip_info },
 	{ .compatible = "adi,pulsar,ad7699", .data = &ad7699_chip_info },
+	{ .compatible = "adi,pulsar,ad7694", .data = &ad7694_chip_info },
 	{ .compatible = "adi,pulsar,ad7693", .data = &ad7693_chip_info },
 	{ .compatible = "adi,pulsar,ad7691", .data = &ad7691_chip_info },
 	{ .compatible = "adi,pulsar,ad7690", .data = &ad7690_chip_info },
@@ -925,31 +964,36 @@ static const struct of_device_id ad_pulsar_of_match[] = {
 	{ .compatible = "adi,pulsar,ad7687", .data = &ad7687_chip_info },
 	{ .compatible = "adi,pulsar,ad7686", .data = &ad7686_chip_info },
 	{ .compatible = "adi,pulsar,ad7685", .data = &ad7685_chip_info },
+	{ .compatible = "adi,pulsar,ad7684", .data = &ad7684_chip_info },
+	{ .compatible = "adi,pulsar,ad7683", .data = &ad7683_chip_info },
 	{ .compatible = "adi,pulsar,ad7682", .data = &ad7682_chip_info },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, ad_pulsar_of_match);
 
 static const struct spi_device_id ad_pulsar_spi_id[] = {
-	{ "adi,pulsar,ad7988-5", (kernel_ulong_t)&ad7988_5_chip_info },
-	{ "adi,pulsar,ad7988-1", (kernel_ulong_t)&ad7988_1_chip_info },
-	{ "adi,pulsar,ad7984", (kernel_ulong_t)&ad7984_chip_info },
-	{ "adi,pulsar,ad7983", (kernel_ulong_t)&ad7983_chip_info },
-	{ "adi,pulsar,ad7982", (kernel_ulong_t)&ad7982_chip_info },
-	{ "adi,pulsar,ad7980", (kernel_ulong_t)&ad7980_chip_info },
-	{ "adi,pulsar,ad7949", (kernel_ulong_t)&ad7949_chip_info },
-	{ "adi,pulsar,ad7946", (kernel_ulong_t)&ad7946_chip_info },
-	{ "adi,pulsar,ad7942", (kernel_ulong_t)&ad7942_chip_info },
-	{ "adi,pulsar,ad7699", (kernel_ulong_t)&ad7699_chip_info },
-	{ "adi,pulsar,ad7693", (kernel_ulong_t)&ad7693_chip_info },
-	{ "adi,pulsar,ad7691", (kernel_ulong_t)&ad7691_chip_info },
-	{ "adi,pulsar,ad7690", (kernel_ulong_t)&ad7690_chip_info },
-	{ "adi,pulsar,ad7689", (kernel_ulong_t)&ad7689_chip_info },
-	{ "adi,pulsar,ad7688", (kernel_ulong_t)&ad7688_chip_info },
-	{ "adi,pulsar,ad7687", (kernel_ulong_t)&ad7687_chip_info },
-	{ "adi,pulsar,ad7686", (kernel_ulong_t)&ad7686_chip_info },
-	{ "adi,pulsar,ad7685", (kernel_ulong_t)&ad7685_chip_info },
-	{ "adi,pulsar,ad7682", (kernel_ulong_t)&ad7682_chip_info },
+	{ "pulsar,ad7988-5", (kernel_ulong_t)&ad7988_5_chip_info },
+	{ "pulsar,ad7988-1", (kernel_ulong_t)&ad7988_1_chip_info },
+	{ "pulsar,ad7984", (kernel_ulong_t)&ad7984_chip_info },
+	{ "pulsar,ad7983", (kernel_ulong_t)&ad7983_chip_info },
+	{ "pulsar,ad7982", (kernel_ulong_t)&ad7982_chip_info },
+	{ "pulsar,ad7980", (kernel_ulong_t)&ad7980_chip_info },
+	{ "pulsar,ad7949", (kernel_ulong_t)&ad7949_chip_info },
+	{ "pulsar,ad7946", (kernel_ulong_t)&ad7946_chip_info },
+	{ "pulsar,ad7942", (kernel_ulong_t)&ad7942_chip_info },
+	{ "pulsar,ad7699", (kernel_ulong_t)&ad7699_chip_info },
+	{ "pulsar,ad7694", (kernel_ulong_t)&ad7694_chip_info },
+	{ "pulsar,ad7693", (kernel_ulong_t)&ad7693_chip_info },
+	{ "pulsar,ad7691", (kernel_ulong_t)&ad7691_chip_info },
+	{ "pulsar,ad7690", (kernel_ulong_t)&ad7690_chip_info },
+	{ "pulsar,ad7689", (kernel_ulong_t)&ad7689_chip_info },
+	{ "pulsar,ad7688", (kernel_ulong_t)&ad7688_chip_info },
+	{ "pulsar,ad7687", (kernel_ulong_t)&ad7687_chip_info },
+	{ "pulsar,ad7686", (kernel_ulong_t)&ad7686_chip_info },
+	{ "pulsar,ad7685", (kernel_ulong_t)&ad7685_chip_info },
+	{ "pulsar,ad7684", (kernel_ulong_t)&ad7684_chip_info },
+	{ "pulsar,ad7683", (kernel_ulong_t)&ad7683_chip_info },
+	{ "pulsar,ad7682", (kernel_ulong_t)&ad7682_chip_info },
 	{ }
 
 };
@@ -968,3 +1012,4 @@ module_spi_driver(ad_pulsar_driver);
 MODULE_AUTHOR("Sergiu Cuciurean <sergiu.cuciurean@analog.com>");
 MODULE_DESCRIPTION("Analog Devices PulSAR ADC family driver");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(IIO_DMAENGINE_BUFFER);

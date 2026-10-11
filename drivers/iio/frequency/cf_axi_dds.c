@@ -1067,7 +1067,7 @@ static const struct iio_enum cf_axi_dds_scale_available = {
 };
 
 static const struct iio_chan_spec_ext_info cf_axi_dds_ext_info[] = {
-	IIO_ENUM_AVAILABLE("scale", &cf_axi_dds_scale_available),
+	IIO_ENUM_AVAILABLE("scale", IIO_SHARED_BY_TYPE, &cf_axi_dds_scale_available),
 	{ },
 };
 
@@ -2114,6 +2114,13 @@ static const struct axidds_core_info adrv9002_rx2tx2_9_01_b_info = {
 	.chip_info = &cf_axi_dds_chip_info_adrv9002_rx2tx2,
 };
 
+static const struct axidds_core_info adrv9025_1_00_a_info = {
+	.version = ADI_AXI_PCORE_VER(9, 1, 'b'),
+	.name = "ADRV9025",
+	.standalone = true,
+	.complex_modified = true,
+};
+
 /* Match table for of_platform binding */
 static const struct of_device_id cf_axi_dds_of_match[] = {
 	{ .compatible = "adi,axi-ad9122-6.00.a", .data = &ad9122_6_00_a_info},
@@ -2166,6 +2173,9 @@ static const struct of_device_id cf_axi_dds_of_match[] = {
 	},{
 	    .compatible = "adi,axi-adrv9002-rx2tx2-1.0",
 	    .data = &adrv9002_rx2tx2_9_01_b_info
+	},{
+	    .compatible = "adi,axi-adrv9025-tx-1.0",
+	    .data = &adrv9025_1_00_a_info,
 	},
 	{ },
 };
@@ -2590,3 +2600,4 @@ module_platform_driver(cf_axi_dds_driver);
 MODULE_AUTHOR("Michael Hennerich <michael.hennerich@analog.com>");
 MODULE_DESCRIPTION("Analog Devices DDS");
 MODULE_LICENSE("GPL v2");
+MODULE_IMPORT_NS(IIO_DMAENGINE_BUFFER);

@@ -195,19 +195,54 @@
 
 		conf {
 			groups = "usb0_0_grp";
-			slew-rate = <SLEW_RATE_SLOW>;
 			io-standard = <IO_STANDARD_LVCMOS18>;
 		};
 
 		conf-rx {
 			pins = "MIO52", "MIO53", "MIO55";
 			bias-high-impedance;
+			drive-strength = <12>;
+			slew-rate = <SLEW_RATE_FAST>;
 		};
 
 		conf-tx {
 			pins = "MIO54", "MIO56", "MIO57", "MIO58", "MIO59",
 			"MIO60", "MIO61", "MIO62", "MIO63";
 			bias-disable;
+			drive-strength = <4>;
+			slew-rate = <SLEW_RATE_SLOW>;
+		};
+	};
+};
+
+&qspi {
+	status = "okay";
+	is-dual = <1>;
+	num-cs = <2>;
+	flash@0 {
+		compatible = "n25q512a", "jedec,spi-nor"; /* 32MB */
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0>, <1>;
+		parallel-memories = /bits/ 64 <0x4000000 0x4000000>; /* 64MB */
+		spi-tx-bus-width = <4>;
+		spi-rx-bus-width = <4>; /* FIXME also DUAL configuration possible */
+		spi-max-frequency = <108000000>; /* Based on DC1 spec */
+		partition@0 { /* for testing purpose */
+			label = "qspi-fsbl-uboot";
+			reg = <0x0 0x100000>;
+		};
+		partition@100000 { /* for testing purpose */
+			label = "qspi-linux";
+			reg = <0x100000 0x500000>;
+		};
+		partition@600000 { /* for testing purpose */
+			label = "qspi-device-tree";
+			reg = <0x600000 0x20000>;
+		};
+		partition@620000 { /* for testing purpose */
+			label = "qspi-rootfs";
+			reg = <0x620000 0x5E0000>;
 		};
 	};
 };
@@ -367,20 +402,6 @@
 		gpios = <13 GPIO_ACTIVE_HIGH>;
 		output-high;
 		line-name = "usb-reset";
-	};
-
-	adrv9002_clksrc {
-		gpio-hog;
-		gpios = <79 GPIO_ACTIVE_HIGH>;
-		output-high;
-		line-name = "adrv9002-clksrc";
-	};
-
-	fan_en {
-		gpio-hog;
-		gpios = <144 GPIO_ACTIVE_HIGH>;
-		output-high;
-		line-name = "fan-en";
 	};
 
 	fan_ctl {
@@ -572,29 +593,60 @@
 
 #include "adi-adrv9002.dtsi"
 
+/ {
+	clocks {
+		adrv9002_clkin2: clock2 {
+			compatible = "fixed-clock";
+
+			clock-frequency = <30720000>;
+			clock-output-names = "adrv9002_refclk_mux0";
+			#clock-cells = <0>;
+		};
+	};
+
+	adrv9002_clk_mux: clk-mux {
+			#clock-cells = <0>;
+			compatible = "gpio-mux-clock";
+			/* 30.72MHz, 38.4MHz */
+			clocks = <&adrv9002_clkin2>, <&adrv9002_clkin>;
+			clock-output-names = "adrv9002_ext_refclk";
+			select-gpios = <&gpio 79 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&adrv9002_clkin {
+	clock-output-names = "adrv9002_refclk_mux1";
+};
+
 &adc0_adrv9002 {
 	reset-gpios = <&gpio 81 GPIO_ACTIVE_LOW>;
 	interrupts = <78 IRQ_TYPE_EDGE_RISING>;
+
+	clocks = <&adrv9002_clk_mux>;
 
 	adi,channels {
 		rx@0 {
 			mux-ctl-gpios = <&gpio 86 GPIO_ACTIVE_HIGH>;
 			mux-ctl2-gpios = <&gpio 87 GPIO_ACTIVE_LOW>;
+			enable-gpios = <&gpio 125 GPIO_ACTIVE_HIGH>;
 		};
 
 		rx@1 {
 			mux-ctl-gpios = <&gpio 88 GPIO_ACTIVE_HIGH>;
 			mux-ctl2-gpios = <&gpio 89 GPIO_ACTIVE_LOW>;
+			enable-gpios = <&gpio 124 GPIO_ACTIVE_HIGH>;
 		};
 
 		tx@0 {
 			mux-ctl-gpios = <&gpio 90 GPIO_ACTIVE_HIGH>;
 			mux-ctl2-gpios = <&gpio 91 GPIO_ACTIVE_LOW>;
+			enable-gpios = <&gpio 123 GPIO_ACTIVE_HIGH>;
 		};
 
 		tx@1 {
 			mux-ctl-gpios = <&gpio 92 GPIO_ACTIVE_LOW>;
 			mux-ctl2-gpios = <&gpio 93 GPIO_ACTIVE_HIGH>;
+			enable-gpios = <&gpio 122 GPIO_ACTIVE_HIGH>;
 		};
 	};
 };

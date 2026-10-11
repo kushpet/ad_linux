@@ -41,15 +41,15 @@
 #include "adrv9001_bf_hal.h"
 #include "adrv9001_bf.h"
 
+#ifdef __KERNEL__
+#define printf(...)     pr_info(__VA_ARGS__)
+#endif
+
 #define ADI_ADRV9001_ARM_BINARY_IMAGE_FILE_SIZE_BYTES (303*1024)
 #define ADI_ADRV9001_STREAM_BINARY_IMAGE_FILE_SIZE_BYTES (32*1024)
 
 #define ADI_ADRV9001_RX_GAIN_TABLE_SIZE_ROWS 256
 #define ADI_ADRV9001_TX_ATTEN_TABLE_SIZE_ROWS 1024
-
-#ifdef __KERNEL__
-#define printf(...)    pr_info(__VA_ARGS__)
-#endif
 
 int32_t adi_adrv9001_Utilities_ArmImage_Load(adi_adrv9001_Device_t *device, const char *armImagePath, adi_adrv9001_ArmSingleSpiWriteMode_e spiWriteMode)
 {
@@ -466,8 +466,10 @@ int32_t adi_adrv9001_Utilities_SystemDebugPostCalibrate(adi_adrv9001_Device_t *a
 	printf("*** ADRV9001 Post-Calibrate System Debugging Started ***\r\n");
 
 	printf("--> . Check RF PLLs \r\n");
-	ADI_MSG_EXPECT("RF Pll Error. Can't prime channel. The device should be calibrated", adi_adrv9001_Radio_Channel_ToPrimed, adrv9001, ADI_RX, ADI_CHANNEL_1);
-	ADI_MSG_EXPECT("RF Pll Error. Can't prime channel. The device should be calibrated", adi_adrv9001_Radio_Channel_ToPrimed, adrv9001, ADI_TX, ADI_CHANNEL_1);
+	ADI_MSG_EXPECT("RF Pll Error. Can't prime channel. The device should be calibrated", adi_adrv9001_Radio_Channel_ToState, adrv9001, ADI_RX, ADI_CHANNEL_1,
+		       ADI_ADRV9001_CHANNEL_PRIMED);
+	ADI_MSG_EXPECT("RF Pll Error. Can't prime channel. The device should be calibrated", adi_adrv9001_Radio_Channel_ToState, adrv9001, ADI_TX, ADI_CHANNEL_1,
+		       ADI_ADRV9001_CHANNEL_PRIMED);
 
 	ADI_MSG_EXPECT("Error fetching PLL LO1 lock status", adi_adrv9001_Radio_PllStatus_Get, adrv9001, ADI_ADRV9001_PLL_LO1, &pllLO1LockStatus);
 	ADI_MSG_EXPECT("Error fetching PLL LO2 lock status", adi_adrv9001_Radio_PllStatus_Get, adrv9001, ADI_ADRV9001_PLL_LO2, &pllLO2LockStatus);
@@ -487,4 +489,102 @@ int32_t adi_adrv9001_Utilities_SystemDebugPostCalibrate(adi_adrv9001_Device_t *a
 	ADI_API_RETURN(adrv9001);
 }
 
+int32_t adi_adrv9001_Utilities_InitCals_WarmBoot_Coefficients_VectTblChunkRead(adi_adrv9001_Device_t *adrv9001,
+																		       uint16_t calNo,
+																			   uint32_t maskChannel1,
+																			   uint32_t maskChannel2,
+																			   uint32_t *addr,
+																			   uint32_t *size,
+																			   uint32_t *initMask,
+																			   uint32_t *profMask)
+{
+	uint32_t address = 0x20020004;
+	uint32_t vecTbl[4] = { 0 };
+
+	/* Check device pointer is not null */
+	ADI_ENTRY_EXPECT(adrv9001);
+
+	ADI_EXPECT(adi_adrv9001_arm_Memory_Read32, adrv9001, (address + (16*calNo)), vecTbl, 16, 0);
+
+	*addr = vecTbl[0];
+	*size =  vecTbl[1];
+	*initMask = vecTbl[2];
+	*profMask = vecTbl[3];
+
+	ADI_API_RETURN(adrv9001);
+}
+
+int32_t adi_adrv9001_Utilities_InitCals_WarmBoot_Coefficients_MaxArrayChunk_Get(adi_adrv9001_Device_t *adrv9001,
+																				uint32_t maskChannel1,
+																				uint32_t maskChannel2,
+																				uint32_t addr,
+																				uint32_t initMask,
+																				uint32_t profMask,
+																				uint8_t calVecTblData[],
+																				uint32_t size)
+{
+	/* Check device pointer is not null */
+	ADI_ENTRY_EXPECT(adrv9001);
+
+	adi_common_ChannelNumber_e channel;
+	for (channel = ADI_CHANNEL_1; channel <= ADI_CHANNEL_2; channel++)
+	{
+		uint32_t chInitMask;
+		if (ADI_CHANNEL_1 == channel)
+		{
+			chInitMask = maskChannel1;
+		}
+		else
+		{
+			chInitMask = maskChannel2;
+		}
+
+		profMask = profMask >> (8 * (channel - 1));
+		if (profMask == 0)
+			continue;
+		if (((initMask & chInitMask) != 0) && ((profMask & adrv9001->devStateInfo.chProfEnMask[channel - 1]) != 0))
+		{
+			ADI_EXPECT(adi_adrv9001_arm_Memory_Read, adrv9001, addr, &calVecTblData[0], size, 0);
+		}
+	}
+
+	ADI_API_RETURN(adrv9001);
+}
+
+int32_t adi_adrv9001_Utilities_InitCals_WarmBoot_Coefficients_MaxArrayChunk_Set(adi_adrv9001_Device_t *adrv9001,
+																				uint32_t maskChannel1,
+																			    uint32_t maskChannel2,
+																				uint32_t addr,
+																				uint32_t initMask,
+																				uint32_t profMask,
+																				uint8_t calVecTblData[],
+																				uint32_t size)
+{
+	/* Check device pointer is not null */
+	ADI_ENTRY_EXPECT(adrv9001);
+
+	adi_common_ChannelNumber_e channel;
+	for (channel = ADI_CHANNEL_1; channel <= ADI_CHANNEL_2; channel++)
+	{
+		uint32_t chInitMask;
+		if (ADI_CHANNEL_1 == channel)
+		{
+			chInitMask = maskChannel1;
+		}
+		else
+		{
+			chInitMask = maskChannel2;
+		}
+
+		profMask = profMask >> (8 * (channel - 1));
+		if (profMask == 0)
+			continue;
+		if (((initMask & chInitMask) != 0) && ((profMask & adrv9001->devStateInfo.chProfEnMask[channel - 1]) != 0))
+		{
+			ADI_EXPECT(adi_adrv9001_arm_Memory_Write, adrv9001, addr, &calVecTblData[0], size, 0);
+		}
+	}
+
+	ADI_API_RETURN(adrv9001);
+}
 

@@ -84,7 +84,7 @@
 #define LTC6952_PD8(x)		FIELD_PREP(LTC6952_PD8_MSK, x)
 
 #define LTC6952_PD_MSK(ch)	GENMASK(((ch) & 0x03) * 2 + 1, ((ch) & 0x03) * 2)
-#define LTC6952_PD(ch, x)	((x) << ((ch) & 0x03))
+#define LTC6952_PD(ch, x)	((x) << ((ch) & 0x03) * 2)
 
 /* LTC6952_REG6 */
 #define LTC6952_RAO_MSK		BIT(7)
@@ -619,6 +619,23 @@ static int ltc6952_setup(struct iio_dev *indio_dev)
 		goto err_unlock;
 
 	ret = ltc6952_write_mask(indio_dev, LTC6952_REG(0x02),
+				 LTC6952_POR_MSK, LTC6952_POR(0));
+	if (ret < 0)
+		goto err_unlock;
+
+	ret = ltc6952_write(indio_dev, LTC6952_REG(0x03), 0xFF);
+	if (ret < 0)
+		goto err_unlock;
+
+	ret = ltc6952_write(indio_dev, LTC6952_REG(0x04), 0xFF);
+	if (ret < 0)
+		goto err_unlock;
+
+	ret = ltc6952_write(indio_dev, LTC6952_REG(0x05), 0x3F);
+	if (ret < 0)
+		goto err_unlock;
+
+	ret = ltc6952_write_mask(indio_dev, LTC6952_REG(0x02),
 				 LTC6952_FILTV_MSK,
 				 LTC6952_FILTV(st->filtv_enable));
 	if (ret < 0)
@@ -1079,15 +1096,13 @@ static int ltc6952_probe(struct spi_device *spi)
 	return jesd204_fsm_start(st->jdev, JESD204_LINKS_ALL);
 }
 
-static int ltc6952_remove(struct spi_device *spi)
+static void ltc6952_remove(struct spi_device *spi)
 {
 	struct iio_dev *indio_dev = spi_get_drvdata(spi);
 
 	iio_device_unregister(indio_dev);
 
 	of_clk_del_provider(spi->dev.of_node);
-
-	return 0;
 }
 
 static const struct spi_device_id ltc6952_id[] = {

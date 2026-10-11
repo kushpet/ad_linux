@@ -42,7 +42,7 @@ static ssize_t period_show(struct device *child,
 
 	pwm_get_state(pwm, &state);
 
-	return sprintf(buf, "%llu\n", state.period);
+	return sysfs_emit(buf, "%llu\n", state.period);
 }
 
 static ssize_t period_store(struct device *child,
@@ -77,7 +77,7 @@ static ssize_t duty_cycle_show(struct device *child,
 
 	pwm_get_state(pwm, &state);
 
-	return sprintf(buf, "%llu\n", state.duty_cycle);
+	return sysfs_emit(buf, "%llu\n", state.duty_cycle);
 }
 
 static ssize_t duty_cycle_store(struct device *child,
@@ -147,7 +147,7 @@ static ssize_t enable_show(struct device *child,
 
 	pwm_get_state(pwm, &state);
 
-	return sprintf(buf, "%d\n", state.enabled);
+	return sysfs_emit(buf, "%d\n", state.enabled);
 }
 
 static ssize_t enable_store(struct device *child,
@@ -206,7 +206,7 @@ static ssize_t polarity_show(struct device *child,
 		break;
 	}
 
-	return sprintf(buf, "%s\n", polarity);
+	return sysfs_emit(buf, "%s\n", polarity);
 }
 
 static ssize_t polarity_store(struct device *child,
@@ -235,69 +235,6 @@ static ssize_t polarity_store(struct device *child,
 	return ret ? : size;
 }
 
-static ssize_t time_unit_show(struct device *child,
-			      struct device_attribute *attr,
-			      char *buf)
-{
-	const struct pwm_device *pwm = child_to_pwm_device(child);
-	const char *unit = "unknown";
-	struct pwm_state state;
-
-	pwm_get_state(pwm, &state);
-
-	switch (state.time_unit) {
-	case PWM_UNIT_SEC:
-		unit = "second";
-		break;
-	case PWM_UNIT_MSEC:
-		unit = "milisecond";
-		break;
-	case PWM_UNIT_USEC:
-		unit = "microsecond";
-		break;
-	case PWM_UNIT_NSEC:
-		unit = "nanosecond";
-		break;
-	case PWM_UNIT_PSEC:
-		unit = "picosecond";
-		break;
-	}
-
-	return sprintf(buf, "%s\n", unit);
-}
-
-static ssize_t time_unit_store(struct device *child,
-			       struct device_attribute *attr,
-			       const char *buf, size_t size)
-{
-	struct pwm_export *export = child_to_pwm_export(child);
-	struct pwm_device *pwm = export->pwm;
-	enum pwm_time_unit unit;
-	struct pwm_state state;
-	int ret;
-
-	if (sysfs_streq(buf, "second"))
-		unit = PWM_UNIT_SEC;
-	else if (sysfs_streq(buf, "milisecond"))
-		unit = PWM_UNIT_MSEC;
-	else if (sysfs_streq(buf, "microsecond"))
-		unit = PWM_UNIT_USEC;
-	else if (sysfs_streq(buf, "nanosecond"))
-		unit = PWM_UNIT_NSEC;
-	else if (sysfs_streq(buf, "picosecond"))
-		unit = PWM_UNIT_PSEC;
-	else
-		return -EINVAL;
-
-	mutex_lock(&export->lock);
-	pwm_get_state(pwm, &state);
-	state.time_unit = unit;
-	ret = pwm_apply_state(pwm, &state);
-	mutex_unlock(&export->lock);
-
-	return ret ? : size;
-}
-
 static ssize_t capture_show(struct device *child,
 			    struct device_attribute *attr,
 			    char *buf)
@@ -310,8 +247,7 @@ static ssize_t capture_show(struct device *child,
 	if (ret)
 		return ret;
 
-	return sprintf(buf, "%llu %llu %llu\n", result.period,
-		       result.duty_cycle, result.phase);
+	return sysfs_emit(buf, "%u %u\n", result.period, result.duty_cycle);
 }
 
 static DEVICE_ATTR_RW(period);
@@ -319,7 +255,6 @@ static DEVICE_ATTR_RW(duty_cycle);
 static DEVICE_ATTR_RW(phase);
 static DEVICE_ATTR_RW(enable);
 static DEVICE_ATTR_RW(polarity);
-static DEVICE_ATTR_RW(time_unit);
 static DEVICE_ATTR_RO(capture);
 
 static struct attribute *pwm_attrs[] = {
@@ -328,7 +263,6 @@ static struct attribute *pwm_attrs[] = {
 	&dev_attr_phase.attr,
 	&dev_attr_enable.attr,
 	&dev_attr_polarity.attr,
-	&dev_attr_time_unit.attr,
 	&dev_attr_capture.attr,
 	NULL
 };
@@ -464,7 +398,7 @@ static ssize_t npwm_show(struct device *parent, struct device_attribute *attr,
 {
 	const struct pwm_chip *chip = dev_get_drvdata(parent);
 
-	return sprintf(buf, "%u\n", chip->npwm);
+	return sysfs_emit(buf, "%u\n", chip->npwm);
 }
 static DEVICE_ATTR_RO(npwm);
 
@@ -536,7 +470,7 @@ static int pwm_class_resume_npwm(struct device *parent, unsigned int npwm)
 	return ret;
 }
 
-static int __maybe_unused pwm_class_suspend(struct device *parent)
+static int pwm_class_suspend(struct device *parent)
 {
 	struct pwm_chip *chip = dev_get_drvdata(parent);
 	unsigned int i;
@@ -567,20 +501,20 @@ static int __maybe_unused pwm_class_suspend(struct device *parent)
 	return ret;
 }
 
-static int __maybe_unused pwm_class_resume(struct device *parent)
+static int pwm_class_resume(struct device *parent)
 {
 	struct pwm_chip *chip = dev_get_drvdata(parent);
 
 	return pwm_class_resume_npwm(parent, chip->npwm);
 }
 
-static SIMPLE_DEV_PM_OPS(pwm_class_pm_ops, pwm_class_suspend, pwm_class_resume);
+static DEFINE_SIMPLE_DEV_PM_OPS(pwm_class_pm_ops, pwm_class_suspend, pwm_class_resume);
 
 static struct class pwm_class = {
 	.name = "pwm",
 	.owner = THIS_MODULE,
 	.dev_groups = pwm_chip_groups,
-	.pm = &pwm_class_pm_ops,
+	.pm = pm_sleep_ptr(&pwm_class_pm_ops),
 };
 
 static int pwmchip_sysfs_match(struct device *parent, const void *data)

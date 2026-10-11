@@ -25,7 +25,7 @@ config KERNEL_ALL_ADI_DRIVERS
 	imply MEDIA_SUPPORT
 	imply MEDIA_CONTROLLER
 	imply MEDIA_CAMERA_SUPPORT
-	imply VIDEO_V4L2
+	imply VIDEO_DEV
 	imply VIDEO_V4L2_SUBDEV_API
 	imply V4L_PLATFORM_DRIVERS
 	imply BACKLIGHT_LCD_SUPPORT
@@ -88,6 +88,10 @@ config KERNEL_ALL_ADI_DRIVERS
 	imply FB_TFT_SEPS525
 	imply LEDS_AS3645A
 	imply CHARGER_LTC4162L
+	imply GPIO_DS4520
+	imply RTC_DRV_MAX31335
+	imply REGULATOR_MAX77503
+	imply REGULATOR_MAX77857
 
 source "drivers/clk/Kconfig.adi"
 source "drivers/hwmon/Kconfig.adi"

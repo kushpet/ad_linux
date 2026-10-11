@@ -112,9 +112,7 @@ static int axiadc_hw_submit_block(struct iio_dma_buffer_queue *queue,
 	struct iio_dev *indio_dev = queue->driver_data;
 	struct axiadc_state *st = iio_priv(indio_dev);
 
-	block->block.bytes_used = block->block.size;
-
-	iio_dmaengine_buffer_submit_block(queue, block, DMA_FROM_DEVICE);
+	iio_dmaengine_buffer_submit_block(queue, block);
 
 	axiadc_write(st, ADI_REG_STATUS, ~0);
 	axiadc_write(st, ADI_REG_DMA_STATUS, ~0);
@@ -568,7 +566,8 @@ static int axiadc_read_raw(struct iio_dev *indio_dev,
 	case IIO_CHAN_INFO_SAMP_FREQ:
 		*val2 = 0;
 		ret = conv->read_raw(indio_dev, chan, val, val2, m);
-		llval = (u64)*val2 << 32 | *val;
+		llval = (((u64)*val2) << 32) | (u32)*val;
+
 		if (ret < 0 || !llval) {
 			tmp = ADI_TO_CLK_FREQ(axiadc_read(st, ADI_REG_CLK_FREQ));
 			llval = tmp * 100000000ULL /* FIXME */ * ADI_TO_CLK_RATIO(axiadc_read(st, ADI_REG_CLK_RATIO));
@@ -694,20 +693,6 @@ static int axiadc_write_raw(struct iio_dev *indio_dev,
 	default:
 		return conv->write_raw(indio_dev, chan, val, val2, mask);
 	}
-}
-
-static int axiadc_read_label(struct iio_dev *indio_dev,
-			     const struct iio_chan_spec *chan, char *label)
-{
-	struct axiadc_state *st = iio_priv(indio_dev);
-	struct axiadc_converter *conv = to_converter(st->dev_spi);
-
-	if (conv && conv->read_label)
-		return conv->read_label(indio_dev, chan, label);
-	else if (chan->extend_name)
-		return sprintf(label, "%s\n", chan->extend_name);
-	else
-		return -ENOSYS;
 }
 
 static int axiadc_read_event_value(struct iio_dev *indio_dev,
@@ -842,7 +827,7 @@ static int axiadc_channel_setup(struct iio_dev *indio_dev,
 	return 0;
 }
 
-static const struct iio_info axiadc_info = {
+static struct iio_info axiadc_info = {
 	.read_raw = &axiadc_read_raw,
 	.write_raw = &axiadc_write_raw,
 	.read_event_value = &axiadc_read_event_value,
@@ -851,7 +836,6 @@ static const struct iio_info axiadc_info = {
 	.write_event_config = &axiadc_write_event_config,
 	.debugfs_reg_access = &axiadc_reg_access,
 	.update_scan_mode = &axiadc_update_scan_mode,
-	.read_label = &axiadc_read_label,
 };
 
 struct axiadc_spidev {
@@ -1083,6 +1067,7 @@ static int axiadc_probe(struct platform_device *pdev)
 	struct resource *mem;
 	struct axiadc_spidev *axiadc_spidev;
 	struct axiadc_converter *conv;
+	struct device_link *link;
 	unsigned int config, skip = 1;
 	int ret;
 
@@ -1119,6 +1104,12 @@ static int axiadc_probe(struct platform_device *pdev)
 		return -ENODEV;
 
 	get_device(axiadc_spidev->dev_spi);
+
+	link = device_link_add(&pdev->dev, axiadc_spidev->dev_spi,
+			       DL_FLAG_AUTOREMOVE_SUPPLIER);
+	if (!link)
+		dev_warn(&pdev->dev, "failed to create device link to %s\n",
+			dev_name(axiadc_spidev->dev_spi));
 
 	ret = devm_add_action_or_reset(&pdev->dev, axiadc_release_converter, axiadc_spidev);
 	if (ret)
@@ -1204,6 +1195,8 @@ static int axiadc_probe(struct platform_device *pdev)
 	axiadc_channel_setup(indio_dev, conv->chip_info->channel,
 			     st->dp_disable ? 0 : conv->chip_info->num_channels);
 
+	/* only have labels if really supported */
+	axiadc_info.read_label = conv->read_label;
 	st->iio_info = axiadc_info;
 	st->iio_info.attrs = conv->attrs;
 	indio_dev->info = &st->iio_info;
@@ -1286,3 +1279,4 @@ module_platform_driver(axiadc_driver);
 MODULE_AUTHOR("Michael Hennerich <hennerich@blackfin.uclinux.org>");
 MODULE_DESCRIPTION("Analog Devices ADI-AIM");
 MODULE_LICENSE("GPL v2");
+MODULE_IMPORT_NS(IIO_DMAENGINE_BUFFER);

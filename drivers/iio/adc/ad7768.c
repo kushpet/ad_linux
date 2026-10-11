@@ -8,9 +8,12 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/module.h>
+#include <linux/math64.h>
+#include <linux/units.h>
 #include <linux/spi/spi.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
+#include <linux/gpio/driver.h>
 #include <linux/regulator/consumer.h>
 
 #include <linux/iio/iio.h>
@@ -27,6 +30,17 @@
 #define AD7768_POWER_MODE			0x04
 #define AD7768_DATA_CONTROL			0x06
 #define AD7768_INTERFACE_CFG			0x07
+
+#define AD7768_REG_GPIO_CONTROL			0x0E
+
+/* AD7768_REG_GPIO_CONTROL */
+#define AD7768_GPIO_UGPIO_ENABLE		BIT(7)
+
+#define AD7768_GPIO_INPUT(x)			0x00
+#define AD7768_GPIO_OUTPUT(x)			BIT(x)
+
+#define AD7768_REG_GPIO_WRITE			0x0F
+#define AD7768_REG_GPIO_READ			0x10
 
 /* AD7768_CH_MODE */
 #define AD7768_CH_MODE_FILTER_TYPE_MSK		BIT(3)
@@ -91,6 +105,7 @@ struct ad7768_state {
 	struct mutex lock;
 	struct regulator *vref;
 	struct clk *mclk;
+	struct gpio_chip gpiochip;
 	unsigned int datalines;
 	unsigned int sampling_freq;
 	enum ad7768_power_modes power_mode;
@@ -451,22 +466,36 @@ static ssize_t ad7768_attr_sampl_freq_avail(struct device *dev,
 
 static IIO_DEV_ATTR_SAMP_FREQ_AVAIL(ad7768_attr_sampl_freq_avail);
 
+static ssize_t ad7768_scale(struct device *dev,
+			    struct device_attribute *attr,
+			    char *buf)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	const struct iio_chan_spec *chan = &indio_dev->channels[0];
+	struct ad7768_state *st = ad7768_get_data(indio_dev);
+	u64 vref_nv;
+	u64 scale;
+	int ret;
+
+	ret = regulator_get_voltage(st->vref);
+	if (ret < 0)
+		return ret;
+
+	vref_nv = (u64)ret * NANO * 2;
+	scale = div64_ul(vref_nv, BIT(chan->scan_type.realbits));
+
+	return scnprintf(buf, PAGE_SIZE, "0.%012llu\n", scale);
+}
+
+static IIO_DEVICE_ATTR(in_voltage_scale, 0644, ad7768_scale, NULL, 0);
+
 static int ad7768_read_raw(struct iio_dev *indio_dev,
 			   const struct iio_chan_spec *chan,
 			   int *val, int *val2, long info)
 {
 	struct ad7768_state *st = ad7768_get_data(indio_dev);
-	int ret;
 
 	switch (info) {
-	case IIO_CHAN_INFO_SCALE:
-		ret = regulator_get_voltage(st->vref);
-		if (ret < 0)
-			return ret;
-
-		*val = 2 * (ret / 1000);
-		*val2 = chan->scan_type.realbits;
-		return IIO_VAL_FRACTIONAL_LOG2;
 	case IIO_CHAN_INFO_SAMP_FREQ:
 		*val = st->sampling_freq;
 		return IIO_VAL_INT;
@@ -491,21 +520,22 @@ static struct iio_chan_spec_ext_info ad7768_ext_info[] = {
 	IIO_ENUM("power_mode",
 		 IIO_SHARED_BY_ALL,
 		 &ad7768_power_mode_enum),
-	IIO_ENUM_AVAILABLE_SHARED("power_mode",
-				  IIO_SHARED_BY_ALL,
-				  &ad7768_power_mode_enum),
+	IIO_ENUM_AVAILABLE("power_mode",
+			   IIO_SHARED_BY_ALL,
+			   &ad7768_power_mode_enum),
 	IIO_ENUM("filter_type",
 		 IIO_SHARED_BY_ALL,
 		 &ad7768_filter_type_iio_enum),
-	IIO_ENUM_AVAILABLE_SHARED("filter_type",
-				  IIO_SHARED_BY_ALL,
-				  &ad7768_filter_type_iio_enum),
+	IIO_ENUM_AVAILABLE("filter_type",
+			   IIO_SHARED_BY_ALL,
+			   &ad7768_filter_type_iio_enum),
 	{ },
 
 };
 
 static struct attribute *ad7768_attributes[] = {
 	&iio_dev_attr_sampling_frequency_available.dev_attr.attr,
+	&iio_dev_attr_in_voltage_scale.dev_attr.attr,
 	NULL
 };
 
@@ -523,7 +553,6 @@ static const struct iio_info ad7768_info = {
 #define AD7768_CHAN(index)						\
 	{								\
 		.type = IIO_VOLTAGE,					\
-		.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE),	\
 		.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SAMP_FREQ),\
 		.address = index,					\
 		.indexed = 1,						\
@@ -562,33 +591,6 @@ static const struct axiadc_chip_info ad7768_4_conv_chip_info = {
 };
 
 static const unsigned long ad7768_available_scan_masks[]  = { 0xFF, 0x00 };
-
-static int hw_submit_block(struct iio_dma_buffer_queue *queue,
-	struct iio_dma_buffer_block *block)
-{
-	block->block.bytes_used = block->block.size;
-
-	return iio_dmaengine_buffer_submit_block(queue, block, DMA_DEV_TO_MEM);
-}
-
-static const struct iio_dma_buffer_ops dma_buffer_ops = {
-	.submit = hw_submit_block,
-	.abort = iio_dmaengine_buffer_abort,
-};
-
-static void ad7768_reg_disable(void *data)
-{
-	struct regulator *reg = data;
-
-	regulator_disable(reg);
-}
-
-static void ad7768_clk_disable(void *data)
-{
-	struct clk *clk = data;
-
-	clk_disable_unprepare(clk);
-}
 
 static int ad7768_datalines_from_dt(struct ad7768_state *st)
 {
@@ -661,9 +663,8 @@ static int ad7768_register_axi_adc(struct ad7768_state *st)
 
 static int ad7768_register(struct ad7768_state *st, struct iio_dev *indio_dev)
 {
-	struct iio_buffer *buffer;
+	int ret;
 
-	indio_dev->dev.parent = &st->spi->dev;
 	indio_dev->name = "ad7768";
 	indio_dev->modes = INDIO_DIRECT_MODE | INDIO_BUFFER_HARDWARE;
 	indio_dev->channels = st->chip_info->channel;
@@ -671,14 +672,121 @@ static int ad7768_register(struct ad7768_state *st, struct iio_dev *indio_dev)
 	indio_dev->info = &ad7768_info;
 	indio_dev->available_scan_masks = ad7768_available_scan_masks;
 
-	buffer = devm_iio_dmaengine_buffer_alloc(indio_dev->dev.parent, "rx",
-						&dma_buffer_ops, indio_dev);
-	if (IS_ERR(buffer))
-		return PTR_ERR(buffer);
-
-	iio_device_attach_buffer(indio_dev, buffer);
+	ret = devm_iio_dmaengine_buffer_setup(indio_dev->dev.parent, indio_dev,
+					      "rx", IIO_BUFFER_DIRECTION_IN);
+	if (ret)
+		return ret;
 
 	return devm_iio_device_register(&st->spi->dev, indio_dev);
+}
+
+static int ad7768_input_gpio(struct gpio_chip *chip, unsigned int offset)
+{
+	struct ad7768_state *st = gpiochip_get_data(chip);
+	int ret;
+
+	mutex_lock(&st->lock);
+	ret = ad7768_spi_write_mask(st,
+				    AD7768_REG_GPIO_CONTROL,
+				    BIT(offset),
+				    AD7768_GPIO_INPUT(offset));
+	mutex_unlock(&st->lock);
+
+	return ret;
+}
+
+static int ad7768_output_gpio(struct gpio_chip *chip,
+			      unsigned int offset, int value)
+{
+	struct ad7768_state *st = gpiochip_get_data(chip);
+	int ret;
+
+	mutex_lock(&st->lock);
+	ret = ad7768_spi_write_mask(st,
+				    AD7768_REG_GPIO_CONTROL,
+				    BIT(offset),
+				    AD7768_GPIO_OUTPUT(offset));
+	if (ret < 0)
+		goto out;
+
+	ret = ad7768_spi_write_mask(st,
+				    AD7768_REG_GPIO_WRITE,
+				    BIT(offset),
+				    (value << offset));
+out:
+	mutex_unlock(&st->lock);
+
+	return ret;
+}
+
+static int ad7768_get_gpio(struct gpio_chip *chip, unsigned int offset)
+{
+	struct ad7768_state *st = gpiochip_get_data(chip);
+	unsigned int val;
+	int ret;
+
+	mutex_lock(&st->lock);
+	ret = ad7768_spi_reg_read(st, AD7768_REG_GPIO_CONTROL, &val);
+	if (ret < 0)
+		goto out;
+
+	if (val & BIT(offset))
+		ret = ad7768_spi_reg_read(st, AD7768_REG_GPIO_WRITE, &val);
+	else
+		ret = ad7768_spi_reg_read(st, AD7768_REG_GPIO_READ, &val);
+	if (ret < 0)
+		goto out;
+
+	ret = !!(val & BIT(offset));
+
+out:
+	mutex_unlock(&st->lock);
+
+	return ret;
+}
+
+static void ad7768_set_gpio(struct gpio_chip *chip, unsigned int offset, int value)
+{
+	struct ad7768_state *st = gpiochip_get_data(chip);
+	unsigned int val;
+	int ret;
+
+	mutex_lock(&st->lock);
+	ret = ad7768_spi_reg_read(st, AD7768_REG_GPIO_CONTROL, &val);
+	if (ret < 0)
+		goto out;
+
+	if (val & BIT(offset))
+		ad7768_spi_write_mask(st,
+				      AD7768_REG_GPIO_WRITE,
+				      BIT(offset),
+				      (value << offset));
+
+out:
+	mutex_unlock(&st->lock);
+}
+
+int ad7768_gpio_setup(struct ad7768_state *st)
+{
+	int ret;
+
+	ret = ad7768_spi_reg_write(st,
+				   AD7768_REG_GPIO_CONTROL,
+				   AD7768_GPIO_UGPIO_ENABLE);
+	if (ret < 0)
+		return ret;
+
+	st->gpiochip.label = "ad7768";
+	st->gpiochip.base = -1;
+	st->gpiochip.ngpio = 5;
+	st->gpiochip.parent = &st->spi->dev;
+	st->gpiochip.can_sleep = true;
+	st->gpiochip.direction_input = ad7768_input_gpio;
+	st->gpiochip.direction_output = ad7768_output_gpio;
+	st->gpiochip.get = ad7768_get_gpio;
+	st->gpiochip.set = ad7768_set_gpio;
+
+	return devm_gpiochip_add_data(&st->spi->dev, &st->gpiochip, st);
 }
 
 static int ad7768_probe(struct spi_device *spi)
@@ -694,33 +802,17 @@ static int ad7768_probe(struct spi_device *spi)
 
 	st = iio_priv(indio_dev);
 
-	st->chip_info = device_get_match_data(&spi->dev);
-	if (!st->chip_info) {
-		st->chip_info = (void *)spi_get_device_id(spi)->driver_data;
-		if (!st->chip_info)
-			return PTR_ERR(st->chip_info);
-	}
+	st->chip_info = spi_get_device_match_data(spi);
+	if (!st->chip_info)
+		return -ENODEV;
 
-	st->vref = devm_regulator_get(&spi->dev, "vref");
-	if (IS_ERR(st->vref))
-		return PTR_ERR(st->vref);
-	ret = regulator_enable(st->vref);
+	ret = devm_regulator_get_enable(&spi->dev, "vref");
 	if (ret)
 		return ret;
 
-	ret = devm_add_action_or_reset(&spi->dev, ad7768_reg_disable, st->vref);
-	if (ret)
-		return ret;
-
-	st->mclk = devm_clk_get(&spi->dev, "mclk");
+	st->mclk = devm_clk_get_enabled(&spi->dev, "mclk");
 	if (IS_ERR(st->mclk))
 		return PTR_ERR(st->mclk);
-	ret = clk_prepare_enable(st->mclk);
-	if (ret < 0)
-		return ret;
-	ret = devm_add_action_or_reset(&spi->dev, ad7768_clk_disable, st->mclk);
-	if (ret)
-		return ret;
 
 	st->spi = spi;
 
@@ -749,6 +841,10 @@ static int ad7768_probe(struct spi_device *spi)
 	ret =  ad7768_spi_write_mask(st, AD7768_INTERFACE_CFG,
 				     AD7768_INTERFACE_CFG_CRC_SELECT_MSK,
 				     AD7768_INTERFACE_CFG_CRC_SELECT);
+	if (ret < 0)
+		return ret;
+
+	ret = ad7768_gpio_setup(st);
 	if (ret < 0)
 		return ret;
 
@@ -792,3 +888,4 @@ module_spi_driver(ad7768_driver);
 MODULE_AUTHOR("Stefan Popa <stefan.popa@analog.com>");
 MODULE_DESCRIPTION("Analog Devices AD7768 ADC");
 MODULE_LICENSE("GPL v2");
+MODULE_IMPORT_NS(IIO_DMAENGINE_BUFFER);

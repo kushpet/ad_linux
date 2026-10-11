@@ -44,7 +44,6 @@
 #include <linux/random.h>
 #include <net/sock.h>
 #include <linux/xilinx_phy.h>
-#include <linux/clk.h>
 
 #include "xilinx_axienet_tsn.h"
 
@@ -215,7 +214,7 @@ void axienet_set_mac_address_tsn(struct net_device *ndev,
 	struct axienet_local *lp = netdev_priv(ndev);
 
 	if (address)
-		ether_addr_copy(ndev->dev_addr, address);
+		eth_hw_addr_set(ndev, address);
 	if (!is_valid_ether_addr(ndev->dev_addr))
 		eth_hw_addr_random(ndev);
 
@@ -1285,8 +1284,11 @@ static void axienet_ethtools_get_regs(struct net_device *ndev,
 	data[39] = axienet_dma_in32(lp->dq[0], XAXIDMA_RX_TDESC_OFFSET);
 }
 
-static void axienet_ethtools_get_ringparam(struct net_device *ndev,
-					   struct ethtool_ringparam *ering)
+static void
+axienet_ethtools_get_ringparam(struct net_device *ndev,
+			       struct ethtool_ringparam *ering,
+			       struct kernel_ethtool_ringparam *kernel_ering,
+			       struct netlink_ext_ack *extack)
 {
 	struct axienet_local *lp = netdev_priv(ndev);
 
@@ -1300,8 +1302,12 @@ static void axienet_ethtools_get_ringparam(struct net_device *ndev,
 	ering->tx_pending = lp->tx_bd_num;
 }
 
-static int axienet_ethtools_set_ringparam(struct net_device *ndev,
-					  struct ethtool_ringparam *ering)
+static int
+axienet_ethtools_set_ringparam(struct net_device *ndev,
+			       struct ethtool_ringparam *ering,
+			       struct kernel_ethtool_ringparam *kernel_ering,
+			       struct netlink_ext_ack *extack)
+
 {
 	struct axienet_local *lp = netdev_priv(ndev);
 
@@ -1596,6 +1602,11 @@ static const struct ethtool_ops axienet_ethtool_ops = {
 #endif
 	.get_link_ksettings = phy_ethtool_get_link_ksettings,
 	.set_link_ksettings = phy_ethtool_set_link_ksettings,
+#if defined(CONFIG_XILINX_TSN_QBR)
+	.get_mm		= axienet_preemption_sts_ethtool,
+	.set_mm		= axienet_preemption_ctrl_ethtool,
+	.get_mm_stats	= axienet_preemption_cnt_ethtool,
+#endif
 };
 
 static int axienet_clk_init(struct platform_device *pdev,
@@ -1895,6 +1906,9 @@ static int axienet_probe(struct platform_device *pdev)
 		lp->eth_irq = platform_get_irq(pdev, 0);
 
 	ret = axienet_tsn_probe(pdev, lp, ndev);
+
+	if (ret)
+		goto cleanup_clk;
 
 	ret = axienet_clk_init(pdev, &lp->aclk, &lp->eth_sclk,
 			       &lp->eth_refclk, &lp->eth_dclk);

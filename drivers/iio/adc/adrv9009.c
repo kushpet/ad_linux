@@ -221,6 +221,7 @@ enum adrv9009_iio_dev_attr {
 	ADRV9009_JESD204_FSM_STATE,
 	ADRV9009_JESD204_FSM_RESUME,
 	ADRV9009_JESD204_FSM_CTRL,
+	ADRV9009_RADIO_CTRL_PIN_MODE_EN,
 };
 
 int adrv9009_spi_read(struct spi_device *spi, unsigned reg)
@@ -1076,7 +1077,8 @@ static int adrv9009_do_setup(struct adrv9009_rf_phy *phy)
 	}
 
 	ret = TALISE_setRxTxEnable(phy->talDevice,
-				   has_rx_and_en(phy) ? phy->talInit.rx.rxChannels : 0,
+				   has_rx_and_en(phy) ?
+					(taliseRxORxChannels_t)phy->talInit.rx.rxChannels : 0,
 				   has_tx_and_en(phy) ? phy->talInit.tx.txChannels : 0);
 	if (ret != TALACT_NO_ACTION) {
 		dev_err(&phy->spi->dev, "%s:%d (ret %d)", __func__, __LINE__, ret);
@@ -1573,6 +1575,19 @@ static ssize_t adrv9009_phy_store(struct device *dev,
 		}
 
 		break;
+	case ADRV9009_RADIO_CTRL_PIN_MODE_EN:
+		if (!phy->is_initialized) {
+			mutex_unlock(&phy->lock);
+			return -EBUSY;
+		}
+
+		ret = strtobool(buf, &enable);
+		if (ret)
+			break;
+		ret = TALISE_setRadioCtlPinMode(phy->talDevice,
+						enable ? phy->pin_options_mask : 0,
+						enable ? phy->orx_en_gpio_pinsel : 0);
+		break;
 	default:
 		ret = -EINVAL;
 	}
@@ -1591,6 +1606,8 @@ static ssize_t adrv9009_phy_show(struct device *dev,
 	struct adrv9009_rf_phy *phy = iio_priv(indio_dev);
 	struct jesd204_dev *jdev = phy->jdev;
 	struct jesd204_link *links[3];
+	taliseRadioCtlCfg2_t orxEnGpioPinSel;
+	u8 pinOptionsMask;
 	int ret = 0;
 	int i, err, num_links;
 	bool paused;
@@ -1692,6 +1709,14 @@ static ssize_t adrv9009_phy_show(struct device *dev,
 
 		ret = sprintf(buf, "%d\n", phy->is_initialized);
 		break;
+	case ADRV9009_RADIO_CTRL_PIN_MODE_EN:
+		ret = TALISE_getRadioCtlPinMode(phy->talDevice,
+						&pinOptionsMask,
+						&orxEnGpioPinSel);
+		if (ret)
+			break;
+		ret = sprintf(buf, "%d\n", !!pinOptionsMask);
+		break;
 	default:
 		ret = -EINVAL;
 	}
@@ -1750,6 +1775,11 @@ static IIO_DEVICE_ATTR(multichip_sync, S_IWUSR,
 		       adrv9009_phy_store,
 		       ADRV9009_MCS);
 
+static IIO_DEVICE_ATTR(radio_pinctrl_en, 0644,
+		       adrv9009_phy_show,
+		       adrv9009_phy_store,
+		       ADRV9009_RADIO_CTRL_PIN_MODE_EN);
+
 /**
  * FIXME: these work only if working with all JESD204 links at once,
  * so, if one link has an error, the first will be shown, and all
@@ -1796,6 +1826,7 @@ static struct attribute *adrv9009_phy_attributes[] = {
 	&iio_dev_attr_calibrate_tx_lol_ext_en.dev_attr.attr,
 	&iio_dev_attr_calibrate_rx_phase_correction_en.dev_attr.attr,
 	&iio_dev_attr_calibrate_fhm_en.dev_attr.attr,
+	&iio_dev_attr_radio_pinctrl_en.dev_attr.attr,
 	NULL,
 };
 
@@ -1811,6 +1842,7 @@ static struct attribute *adrv90081_phy_attributes[] = {
 	&iio_dev_attr_calibrate_rx_qec_en.dev_attr.attr,
 	&iio_dev_attr_calibrate_rx_phase_correction_en.dev_attr.attr,
 	&iio_dev_attr_calibrate_fhm_en.dev_attr.attr,
+	&iio_dev_attr_radio_pinctrl_en.dev_attr.attr,
 	NULL,
 };
 
@@ -1827,6 +1859,7 @@ static struct attribute *adrv90082_phy_attributes[] = {
 	&iio_dev_attr_calibrate_tx_lol_en.dev_attr.attr,
 	&iio_dev_attr_calibrate_tx_lol_ext_en.dev_attr.attr,
 	&iio_dev_attr_calibrate_fhm_en.dev_attr.attr,
+	&iio_dev_attr_radio_pinctrl_en.dev_attr.attr,
 	NULL,
 };
 
@@ -2671,8 +2704,8 @@ static const struct iio_chan_spec_ext_info adrv9009_phy_rx_ext_info[] = {
 	 * values > 2^32 in order to support the entire frequency range
 	 * in Hz. Using scale is a bit ugly.
 	 */
-	IIO_ENUM_AVAILABLE_SHARED("gain_control_mode", 0,  &adrv9009_agc_modes_available),
-	IIO_ENUM("gain_control_mode", false, &adrv9009_agc_modes_available),
+	IIO_ENUM_AVAILABLE("gain_control_mode", IIO_SEPARATE,  &adrv9009_agc_modes_available),
+	IIO_ENUM("gain_control_mode", IIO_SEPARATE, &adrv9009_agc_modes_available),
 	_ADRV9009_EXT_RX_INFO("rssi", RSSI),
 	_ADRV9009_EXT_RX_INFO("quadrature_tracking_en", RX_QEC),
 	_ADRV9009_EXT_RX_INFO("bb_dc_offset_tracking_en", RX_BBDC),
@@ -2688,8 +2721,8 @@ static const struct iio_chan_spec_ext_info adrv9009_phy_obs_rx_ext_info[] = {
 	 * values > 2^32 in order to support the entire frequency range
 	 * in Hz. Using scale is a bit ugly.
 	 */
-	IIO_ENUM_AVAILABLE_SHARED("rf_port_select", 0, &adrv9009_rf_obs_rx_port_available),
-	IIO_ENUM("rf_port_select", false, &adrv9009_rf_obs_rx_port_available),
+	IIO_ENUM_AVAILABLE("rf_port_select", IIO_SEPARATE, &adrv9009_rf_obs_rx_port_available),
+	IIO_ENUM("rf_port_select", IIO_SEPARATE, &adrv9009_rf_obs_rx_port_available),
 	_ADRV9009_EXT_RX_INFO("quadrature_tracking_en", RX_QEC),
 	_ADRV9009_EXT_RX_INFO("bb_dc_offset_tracking_en", RX_BBDC),
 	_ADRV9009_EXT_RX_INFO("rf_bandwidth", RX_RF_BANDWIDTH),
@@ -3680,6 +3713,10 @@ static int adrv9009_restart(struct adrv9009_rf_phy *phy)
 {
 	int ret;
 
+	phy->framer_b_m = phy->talInit.jesd204Settings.framerB.M;
+	phy->framer_b_f = phy->talInit.jesd204Settings.framerB.F;
+	phy->orx_channel_enabled = phy->talInit.obsRx.obsRxChannelsEnable;
+
 	if (phy->jdev) {
 		if(jesd204_dev_is_top(phy->jdev)) {
 			int retry = 1;
@@ -3742,6 +3779,18 @@ static ssize_t adrv9009_debugfs_write(struct file *file,
 		ret = TALISE_enableFramerTestData(phy->talDevice,
 						  entry->cmd == DBGFS_BIST_FRAMER_A_PRBS ? TAL_FRAMER_A : TAL_FRAMER_B,
 						  val, TAL_FTD_FRAMERINPUT);
+		mutex_unlock(&phy->lock);
+		if (ret)
+			return ret;
+
+		entry->val = val;
+		return count;
+	case DBGFS_BIST_SERIALIZER_A_PRBS:
+	case DBGFS_BIST_SERIALIZER_B_PRBS:
+		mutex_lock(&phy->lock);
+		ret = TALISE_enableFramerTestData(phy->talDevice,
+			entry->cmd == DBGFS_BIST_SERIALIZER_A_PRBS ? TAL_FRAMER_A : TAL_FRAMER_B,
+			val, TAL_FTD_SERIALIZER);
 		mutex_unlock(&phy->lock);
 		if (ret)
 			return ret;
@@ -3880,6 +3929,8 @@ static int adrv9009_register_debugfs(struct iio_dev *indio_dev)
 	adrv9009_add_debugfs_entry(phy, "initialize", DBGFS_INIT);
 	adrv9009_add_debugfs_entry(phy, "bist_framer_a_prbs", DBGFS_BIST_FRAMER_A_PRBS);
 	adrv9009_add_debugfs_entry(phy, "bist_framer_b_prbs", DBGFS_BIST_FRAMER_B_PRBS);
+	adrv9009_add_debugfs_entry(phy, "bist_serializer_a_prbs", DBGFS_BIST_SERIALIZER_A_PRBS);
+	adrv9009_add_debugfs_entry(phy, "bist_serializer_b_prbs", DBGFS_BIST_SERIALIZER_B_PRBS);
 	adrv9009_add_debugfs_entry(phy, "bist_framer_a_loopback", DBGFS_BIST_FRAMER_A_LOOPBACK);
 	adrv9009_add_debugfs_entry(phy, "bist_framer_b_loopback", DBGFS_BIST_FRAMER_B_LOOPBACK);
 	adrv9009_add_debugfs_entry(phy, "bist_tone", DBGFS_BIST_TONE);
@@ -4606,6 +4657,10 @@ static int adrv9009_phy_parse_dt(struct iio_dev *iodev, struct device *dev)
 	ADRV9009_OF_PROP("adi,aux-pll-lo-frequency_hz", &phy->aux_lo_frequency,
 			 2500000000ULL);
 
+	ADRV9009_OF_PROP("adi,radio-ctl-pin-mode-options-mask",
+			 &phy->pin_options_mask, TAL_TXRX_PIN_MODE);
+	ADRV9009_OF_PROP("adi,radio-ctl-pin-mode-orx-en-pinsel",
+			 &phy->orx_en_gpio_pinsel, TAL_ORX1ORX2_PAIR_NONE_SEL);
 
 	phy->loopFilter_stability = 3;
 
@@ -5471,8 +5526,6 @@ static irqreturn_t adrv9009_irq_handler(int irq, void *p)
 	case TALACT_ERR_REDUCE_TXSAMPLE_PWR:
 		TALISE_clearPaProtectErrorFlags(phy->talDevice);
 		msleep(500);
-	default:
-		break;
 	}
 
 	return IRQ_HANDLED;
@@ -6252,7 +6305,7 @@ static int adrv9009_jesd204_post_running_stage(struct jesd204_dev *jdev,
 		return -EFAULT;
 	}
 	ret = TALISE_setRxTxEnable(phy->talDevice,
-		has_rx_and_en(phy) ? phy->talInit.rx.rxChannels : 0,
+		has_rx_and_en(phy) ? (taliseRxORxChannels_t)phy->talInit.rx.rxChannels : 0,
 		has_tx_and_en(phy) ? phy->talInit.tx.txChannels : 0);
 	if (ret != TALACT_NO_ACTION) {
 		dev_err(&phy->spi->dev,
@@ -6806,7 +6859,7 @@ out_unregister_notifier:
 	return ret;
 }
 
-static int adrv9009_remove(struct spi_device *spi)
+static void adrv9009_remove(struct spi_device *spi)
 {
 	struct adrv9009_rf_phy *phy = adrv9009_spi_to_phy(spi);
 
@@ -6821,8 +6874,6 @@ static int adrv9009_remove(struct spi_device *spi)
 	clk_disable_unprepare(phy->fmc2_clk);
 
 	adrv9009_shutdown(phy);
-
-	return 0;
 }
 
 static const struct spi_device_id adrv9009_id[] = {

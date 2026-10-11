@@ -21,16 +21,6 @@ void xhdmiphy_intr_dis(struct xhdmiphy_dev *inst, u32 intr)
 	xhdmiphy_write(inst, XHDMIPHY_INTR_DIS_REG, reg_val);
 }
 
-static void xhdmiphy_set(struct xhdmiphy_dev *inst, u32 addr, u32 set)
-{
-	xhdmiphy_write(inst, addr, xhdmiphy_read(inst, addr) | set);
-}
-
-inline void xhdmiphy_clr(struct xhdmiphy_dev *inst, u32 addr, u32 clr)
-{
-	xhdmiphy_write(inst, addr, xhdmiphy_read(inst, addr) & ~clr);
-}
-
 /**
  * xhdmiphy_outdiv_reconf - This function will set the current output divider
  * configuration over DRP.
@@ -492,6 +482,9 @@ u32 xhdmiphy_init_phy(struct xhdmiphy_dev *inst)
 {
 	u8 id, id0, id1;
 
+	if (inst->phy_ready)
+		return 0;
+
 	xhdmiphy_cfg_init(inst);
 
 	xhdmiphy_ch2ids(inst, XHDMIPHY_CHID_CHA, &id0, &id1);
@@ -624,6 +617,8 @@ u32 xhdmiphy_init_phy(struct xhdmiphy_dev *inst)
 			xhdmiphy_set_tx_pc(inst, (enum chid)id, 0x5);
 		}
 	}
+	inst->phy_ready = true;
+	dev_dbg(inst->dev, "HDMI PHY is initialized and ready\n");
 
 	return 0;
 }
@@ -804,7 +799,7 @@ static u32 xhdmiphy_lcpll_param(struct xhdmiphy_dev *inst, enum chid chid,
 			if ((XHDMIPHY_HDMI14_REFCLK_RANGE1 <= (*refclk_ptr)) &&
 			    ((*refclk_ptr) <= XHDMIPHY_HDMI14_REFCLK_RANGE2)) {
 				inst->quad.lcpll.linerate_cfg = 1;
-			} else if ((XHDMIPHY_HDMI14_REFCLK_RANGE3 <= (*refclk_ptr)) &&
+			} else if ((XHDMIPHY_HDMI14_REFCLK_RANGE2 <= (*refclk_ptr)) &&
 						/* 297 MHz + 0.5% + 10 KHz error */
 						((*refclk_ptr) <=
 						 XHDMIPHY_HDMI14_REFCLK_RANGE3)) {

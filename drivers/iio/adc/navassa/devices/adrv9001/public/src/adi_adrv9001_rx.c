@@ -596,10 +596,26 @@ static __maybe_unused int32_t __maybe_unused adi_adrv9001_Rx_Rssi_Read_Validate(
                                                                  uint32_t *rxRssiPower_mdB,
                                                                  adi_common_ChannelNumber_e rxChannel)
 {
-    ADI_NULL_PTR_RETURN(&device->common, rxRssiPower_mdB);
+	adi_adrv9001_ChannelState_e state = ADI_ADRV9001_CHANNEL_STANDBY;
 
-    /* Check that the requested channel mask is valid */
-    ADI_RANGE_CHECK(device, rxChannel, ADI_CHANNEL_1, ADI_CHANNEL_2);
+	/* Check device pointer is not null */
+	ADI_ENTRY_EXPECT(device);
+
+	ADI_NULL_PTR_RETURN(&device->common, rxRssiPower_mdB);
+
+	/* Check that the requested channel mask is valid */
+	ADI_RANGE_CHECK(device, rxChannel, ADI_CHANNEL_1, ADI_CHANNEL_2);
+
+	ADI_EXPECT(adi_adrv9001_Radio_Channel_State_Get, device, ADI_RX, rxChannel, &state);
+	if (ADI_ADRV9001_CHANNEL_RF_ENABLED != state)
+	{
+		ADI_ERROR_REPORT(device,
+			ADI_COMMON_ERRSRC_API,
+			ADI_COMMON_ERR_API_FAIL,
+			ADI_COMMON_ACT_ERR_CHECK_PARAM,
+			state,
+			"Error attempting to read RSSI. Specified channel must be in RF_ENABLED state");
+	}
 
     ADI_API_RETURN(device);
 }
@@ -1469,8 +1485,21 @@ static __maybe_unused int32_t __maybe_unused adi_adrv9001_Rx_GainIndex_Gpio_Conf
     ADI_RANGE_CHECK(device, gainIndexPinCfgchannel->gainIndex_01_00, ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED, ADI_ADRV9001_GPIO_PIN_CRUMB_15_14);
     ADI_RANGE_CHECK(device, gainIndexPinCfgchannel->gainIndex_03_02, ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED, ADI_ADRV9001_GPIO_PIN_CRUMB_15_14);
     ADI_RANGE_CHECK(device, gainIndexPinCfgchannel->gainIndex_05_04, ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED, ADI_ADRV9001_GPIO_PIN_CRUMB_15_14);
-    ADI_RANGE_CHECK(device, gainIndexPinCfgchannel->gainIndex_07_06, ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED, ADI_ADRV9001_GPIO_PIN_CRUMB_15_14);
-    ADI_EXPECT(adi_adrv9001_Radio_Channel_State_Get, device, ADI_RX, channel, &state);
+    ADI_RANGE_CHECK(device, gainIndexPinCfgchannel->gainChange_gainIndex_06, ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED, ADI_ADRV9001_GPIO_PIN_CRUMB_15_14);
+	if ((gainIndexPinCfgchannel->gainIndex_01_00 == ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED) &&
+		(gainIndexPinCfgchannel->gainIndex_03_02 == ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED) &&
+		(gainIndexPinCfgchannel->gainIndex_05_04 == ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED) &&
+		(gainIndexPinCfgchannel->gainChange_gainIndex_06 == ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED))
+	{
+		ADI_ERROR_REPORT(&device->common,
+			ADI_COMMON_ERRSRC_API,
+			ADI_COMMON_ERR_API_FAIL,
+			ADI_COMMON_ACT_ERR_CHECK_PARAM,
+			NULL,
+			"All crumbs cannot be unassigned");
+		ADI_API_RETURN(device)
+	}
+	ADI_EXPECT(adi_adrv9001_Radio_Channel_State_Get, device, ADI_RX, channel, &state);
     if (ADI_ADRV9001_CHANNEL_CALIBRATED != state)
     {
         ADI_ERROR_REPORT(&device->common,
@@ -1525,7 +1554,7 @@ int32_t adi_adrv9001_Rx_GainIndex_Gpio_Configure(adi_adrv9001_Device_t *device,
     gpioCrumb1_0 = (uint8_t)gainIndexPinCfgchannel->gainIndex_01_00;
     gpioCrumb3_2 = (uint8_t)gainIndexPinCfgchannel->gainIndex_03_02;
     gpioCrumb5_4 = (uint8_t)gainIndexPinCfgchannel->gainIndex_05_04;
-    gpioCrumb7_6 = (uint8_t)gainIndexPinCfgchannel->gainIndex_07_06;
+    gpioCrumb7_6 = (uint8_t)gainIndexPinCfgchannel->gainChange_gainIndex_06;
 
     if (ADI_CHANNEL_1 == channel)
     {
@@ -1543,17 +1572,43 @@ int32_t adi_adrv9001_Rx_GainIndex_Gpio_Configure(adi_adrv9001_Device_t *device,
     }
 
     ADI_EXPECT(adrv9001_NvsRegmapCore_NvsGpioDirectionControlOe_Get, device, &gpioOutEn);
-    gpioOutEn |= (1 << (gpioCrumb1_0 * 2 - 1)) | (1 << (gpioCrumb1_0 * 2 - 2));
-    gpioOutEn |= (1 << (gpioCrumb3_2 * 2 - 1)) | (1 << (gpioCrumb3_2 * 2 - 2));
-    gpioOutEn |= (1 << (gpioCrumb5_4 * 2 - 1)) | (1 << (gpioCrumb5_4 * 2 - 2));
-    gpioOutEn |= (1 << (gpioCrumb7_6 * 2 - 1)) | (1 << (gpioCrumb7_6 * 2 - 2));
+
+	if (gpioCrumb1_0 != ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED)
+	{
+		gpioOutEn |= (1 << (gpioCrumb1_0 * 2 - 1)) | (1 << (gpioCrumb1_0 * 2 - 2));
+	}
+	if(gpioCrumb3_2 != ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED)
+	{
+		gpioOutEn |= (1 << (gpioCrumb3_2 * 2 - 1)) | (1 << (gpioCrumb3_2 * 2 - 2));
+	}
+	if (gpioCrumb5_4 != ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED)
+	{
+		gpioOutEn |= (1 << (gpioCrumb5_4 * 2 - 1)) | (1 << (gpioCrumb5_4 * 2 - 2));
+	}
+	if (gpioCrumb7_6 != ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED)
+	{
+		gpioOutEn |= (1 << (gpioCrumb7_6 * 2 - 1)) | (1 << (gpioCrumb7_6 * 2 - 2));
+	}
+
     ADI_EXPECT(adrv9001_NvsRegmapCore_NvsGpioDirectionControlOe_Set, device, gpioOutEn);
 
     /* Configure source */
-    ADRV9001_SPIWRITEBYTE(device, "GPIO_SOURCE_SEL", (GPIO_SOURCE_SEL_ADDR + gpioCrumb1_0 - 1), gpioSource1_0);
-    ADRV9001_SPIWRITEBYTE(device, "GPIO_SOURCE_SEL", (GPIO_SOURCE_SEL_ADDR + gpioCrumb3_2 - 1), gpioSource3_2);
-    ADRV9001_SPIWRITEBYTE(device, "GPIO_SOURCE_SEL", (GPIO_SOURCE_SEL_ADDR + gpioCrumb5_4 - 1), gpioSource5_4);
-    ADRV9001_SPIWRITEBYTE(device, "GPIO_SOURCE_SEL", (GPIO_SOURCE_SEL_ADDR + gpioCrumb7_6 - 1), gpioSource7_6);
+	if (gpioCrumb1_0 != ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED)
+	{
+		ADRV9001_SPIWRITEBYTE(device, "GPIO_SOURCE_SEL", (GPIO_SOURCE_SEL_ADDR + gpioCrumb1_0 - 1), gpioSource1_0);
+	}
+	if (gpioCrumb3_2 != ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED)
+	{
+		ADRV9001_SPIWRITEBYTE(device, "GPIO_SOURCE_SEL", (GPIO_SOURCE_SEL_ADDR + gpioCrumb3_2 - 1), gpioSource3_2);
+	}
+	if (gpioCrumb5_4 != ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED)
+	{
+		ADRV9001_SPIWRITEBYTE(device, "GPIO_SOURCE_SEL", (GPIO_SOURCE_SEL_ADDR + gpioCrumb5_4 - 1), gpioSource5_4);
+	}
+	if (gpioCrumb7_6 != ADI_ADRV9001_GPIO_PIN_CRUMB_UNASSIGNED)
+	{
+		ADRV9001_SPIWRITEBYTE(device, "GPIO_SOURCE_SEL", (GPIO_SOURCE_SEL_ADDR + gpioCrumb7_6 - 1), gpioSource7_6);
+	}
 
     ADI_EXPECT(adrv9001_NvsRegmapRx_ControlOutMuxSel_Set, device, instance, GAIN_INDEX_MUX_ADDRESS);
 
@@ -2088,6 +2143,11 @@ int32_t adi_adrv9001_Rx_Rssi_Manual_Configure(adi_adrv9001_Device_t* adrv9001,
 
 	ADI_PERFORM_VALIDATION(adi_adrv9001_Rx_Rssi_Manual_Configure_Validate, adrv9001, channel, rssiInterval);
 
+	if (ADI_CHANNEL_2 == channel)
+	{
+		instance = ADRV9001_BF_RXB2_CORE;
+	}
+
     /* RSSI Tap Point select and mode */
     ADI_MSG_EXPECT("Error selecting RSSI tap point", adrv9001_NvsRegmapRxb_DcsgPmDsel_Set, adrv9001, instance, setRssiTapPoint);
     ADI_MSG_EXPECT("Error setting RSSI Mode", adrv9001_NvsRegmapRxb_DcsgPmMode_Set, adrv9001, instance, setRssiMode);
@@ -2121,6 +2181,11 @@ int32_t adi_adrv9001_Rx_Rssi_Manual_Status_Get(adi_adrv9001_Device_t *adrv9001,
 	adrv9001_BfNvsRegmapRxb_e instance = ADRV9001_BF_RXB1_CORE;
 
 	ADI_PERFORM_VALIDATION(adi_adrv9001_Rx_Rssi_Manual_Status_Get_Validate, adrv9001, channel);
+
+	if (ADI_CHANNEL_2 == channel)
+	{
+		instance = ADRV9001_BF_RXB2_CORE;
+	}
 
     if (manualRssiReadMode == ADI_ADRV9001_RSSI_READ_HIGH_SPEED_MODE)
     {

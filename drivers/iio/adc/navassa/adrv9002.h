@@ -10,6 +10,7 @@
 #ifndef IIO_TRX_ADRV9002_H_
 #define IIO_TRX_ADRV9002_H_
 
+#include <linux/limits.h>
 #include <linux/clk-provider.h>
 #include <linux/clk/clkscale.h>
 #include <linux/delay.h>
@@ -21,10 +22,12 @@
 #include "adi_adrv9001_cals_types.h"
 #include "adi_adrv9001_dpd_types.h"
 #include "adi_adrv9001_fh_types.h"
+#include "adi_adrv9001_mcs_types.h"
 #include "adi_adrv9001_radio_types.h"
 #include "adi_adrv9001_rx_gaincontrol_types.h"
 #include "adi_adrv9001_rxSettings_types.h"
 #include "adi_adrv9001_ssi_types.h"
+#include "adi_adrv9001_types.h"
 #include "linux_platform.h"
 
 struct iio_chan_spec;
@@ -34,11 +37,14 @@ struct iio_chan_spec;
 #define ADRV_ADDRESS_CHAN(addr)		((addr) & 0xFF)
 #define ADRV9002_FH_HOP_SIGNALS_NR	2
 #define ADRV9002_FH_TABLES_NR		2
-#define ADRV9002_FH_BIN_ATTRS_CNT	(ADRV9002_FH_HOP_SIGNALS_NR * ADRV9002_FH_TABLES_NR)
 #define ADRV9002_RX_MIN_GAIN_IDX	ADI_ADRV9001_RX_GAIN_INDEX_MIN
 #define ADRV9002_RX_MAX_GAIN_IDX	ADI_ADRV9001_RX_GAIN_INDEX_MAX
 #define ADRV9002_DPD_MAX_REGIONS	8
 #define ADRV9002_DPD_FH_MAX_REGIONS	(ADRV9002_DPD_MAX_REGIONS - 1)
+#define ADRV9002_INIT_CALS_COEFFS_MAX	\
+	(ADI_ADRV9001_WB_MAX_NUM_UNIQUE_CALS * ADI_ADRV9001_WB_MAX_NUM_COEFF)
+#define ADRV9002_RX1_REF_CLK		1
+#define ADRV9002_RX2_REF_CLK		2
 
 enum {
 	ADRV9002_CHANN_1,
@@ -153,6 +159,7 @@ struct adrv9002_chan {
 	struct clk *clk;
 	struct gpio_desc *mux_ctl;
 	struct gpio_desc *mux_ctl_2;
+	struct gpio_desc *ensm;
 	struct adrv9002_ext_lo *ext_lo;
 	u64 carrier;
 	/*
@@ -160,6 +167,7 @@ struct adrv9002_chan {
 	 * @adrv9002_chan_ns_to_en_delay() before passing them to the API.
 	 */
 	struct adi_adrv9001_ChannelEnablementDelays en_delays_ns;
+	struct adi_adrv9001_McsDelay mcs_delay;
 	unsigned long rate;
 	adi_adrv9001_InitCalibrations_e lo_cals;
 	adi_adrv9001_ChannelState_e cached_state;
@@ -189,6 +197,13 @@ struct adrv9002_tx_chan {
 	struct adi_adrv9001_DpdInitCfg *dpd_init;
 	struct adi_adrv9001_DpdCfg *dpd;
 	struct adi_adrv9001_TxAttenuationPinControlCfg *pin_cfg;
+	/*
+	 * 0 - Independent
+	 * 1 - Driven by RX1
+	 * 2 - Driven by RX2
+	 */
+	unsigned int rx_ref_clk;
+	u8 port_sel;
 	u8 dac_boost_en;
 	u8 elb_en;
 	u8 ext_path_calib;
@@ -204,8 +219,12 @@ struct adrv9002_gpio {
 };
 
 struct adrv9002_fh_bin_table {
-	/* page size should be more than enough for a max of 64 entries! */
-	u8 bin_table[PAGE_SIZE];
+	/*
+	 * page size should be more than enough for a max of 64 entries!
+	 * +1 so we the table can be properly NULL terminated.
+	 */
+	u8 bin_table[PAGE_SIZE + 1];
+	adi_adrv9001_FhHopFrame_t hop_tbl[ADI_ADRV9001_FH_MAX_HOP_TABLE_SIZE];
 };
 
 #define to_clk_priv(_hw) container_of(_hw, struct adrv9002_clock, hw)
@@ -214,6 +233,8 @@ struct adrv9002_chip_info {
 	const struct iio_chan_spec *channels;
 	const char *cmos_profile;
 	const char *lvd_profile;
+	const char *cmos_cals;
+	const char *lvds_cals;
 	const char *name;
 	u32 num_channels;
 	u32 n_tx;
@@ -226,6 +247,12 @@ struct adrv9002_ext_lo {
 	u16 divider;
 };
 
+struct adrv9002_warm_boot {
+	char coeffs_name[NAME_MAX];
+	u32 size;
+	u8 *cals;
+};
+
 struct adrv9002_rf_phy {
 	const struct adrv9002_chip_info *chip;
 	struct spi_device		*spi;
@@ -233,6 +260,8 @@ struct adrv9002_rf_phy {
 	struct gpio_desc		*reset_gpio;
 	struct gpio_desc		*ssi_sync;
 	struct iio_chan_spec		*iio_chan;
+	struct clk			*dev_clk;
+	struct adrv9002_warm_boot	warm_boot;
 	/* Protect against concurrent accesses to the device */
 	struct mutex			lock;
 	struct clk			*clks[NUM_ADRV9002_CLKS];
@@ -240,12 +269,12 @@ struct adrv9002_rf_phy {
 	struct clk_onecell_data		clk_data;
 	/* each LO controls two ports (at least) */
 	struct adrv9002_ext_lo		ext_los[ADRV9002_CHANN_MAX];
-	char				profile_buf[350];
+	char				profile_buf[400];
 	size_t				profile_len;
 	char				*bin_attr_buf;
 	u8				*stream_buf;
 	u16				stream_size;
-	struct adrv9002_fh_bin_table	fh_table_bin_attr[ADRV9002_FH_BIN_ATTRS_CNT];
+	struct adrv9002_fh_bin_table	fh_table_bin_attr;
 	adi_adrv9001_FhCfg_t		fh;
 	struct adrv9002_rx_chan		rx_channels[ADRV9002_CHANN_MAX];
 	struct adrv9002_tx_chan		tx_channels[ADRV9002_CHANN_MAX];
@@ -259,15 +288,12 @@ struct adrv9002_rf_phy {
 	struct adi_adrv9001_InitCals	init_cals;
 	bool				run_cals;
 	u32				n_clks;
+	u32				dev_clkout_div;
 	int				ngpios;
 	u8				rx2tx2;
 	/* ssi type of the axi cores - cannot really change at runtime */
 	enum adi_adrv9001_SsiType	ssi_type;
-	/*
-	 * Tells if TX only profiles are valid. If not set, it means that TX1/TX2 SSI clocks are
-	 * derived from RX1/RX2 which means that TX cannot be enabled if RX is not...
-	 */
-	u8				tx_only;
+	bool				mcs_run;
 #ifdef CONFIG_DEBUG_FS
 	struct adi_adrv9001_SsiCalibrationCfg ssi_delays;
 #endif
@@ -286,6 +312,9 @@ int adrv9002_intf_test_cfg(const struct adrv9002_rf_phy *phy, const int chann, c
 int adrv9002_check_tx_test_pattern(const struct adrv9002_rf_phy *phy, const int chann);
 int adrv9002_intf_change_delay(const struct adrv9002_rf_phy *phy, const int channel, u8 clk_delay,
 			       u8 data_delay, const bool tx);
+int adrv9002_tx2_fixup(const struct adrv9002_rf_phy *phy);
+adi_adrv9001_SsiTestModeData_e adrv9002_get_test_pattern(const struct adrv9002_rf_phy *phy,
+							 unsigned int chan, bool rx, bool stop);
 /* phy lock must be held before entering the API */
 int adrv9002_channel_to_state(const struct adrv9002_rf_phy *phy, struct adrv9002_chan *chann,
 			      const adi_adrv9001_ChannelState_e state, const bool cache_state);

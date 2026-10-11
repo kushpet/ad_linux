@@ -5,6 +5,7 @@
  * Copyright 2022 Analog Devices Inc.
  */
 #include <linux/bitfield.h>
+#include <linux/bitops.h>
 #include <linux/clk.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
@@ -20,6 +21,7 @@
 #include <linux/limits.h>
 #include <linux/kconfig.h>
 #include <linux/kernel.h>
+#include <linux/log2.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
@@ -28,7 +30,10 @@
 #include <linux/regmap.h>
 #include <linux/sysfs.h>
 #include <linux/spi/spi.h>
-#include <linux/spi/spi-engine.h>
+#include <linux/spi/spi-engine-ex.h>
+#include <linux/util_macros.h>
+#include <linux/units.h>
+#include <linux/types.h>
 
 #define AD4630_REG_INTERFACE_CONFIG_A	0x00
 #define AD4630_REG_INTERFACE_CONFIG_B	0x01
@@ -67,21 +72,19 @@
 #define AD4630_SW_RESET			(BIT(0) | BIT(7))
 /* CHIP GRADE */
 #define AD4630_MSK_CHIP_GRADE		GENMASK(7, 3)
-#define AD4630_CHIP_GRADE(grade)	FIELD_GET(AD4630_MSK_CHIP_GRADE, grade)
 /* MODES */
 #define AD4630_LANE_MODE_MSK		GENMASK(7, 6)
 #define AD4630_CLK_MODE_MSK		GENMASK(5, 4)
 #define AD4630_DATA_RATE_MODE_MSK	BIT(3)
 #define AD4630_OUT_DATA_MODE_MSK	GENMASK(2, 0)
-/* EXIT_CFG_MD */
-#define AD4630_EXIT_CFG_MODE		BIT(0)
 /* AVG */
-#define AD4630_AVG_FILTER_RESET		BIT(7)
+#define AD4630_AVG_AVG_VAL		GENMASK(4, 0)
 /* OFFSET */
 #define AD4630_REG_CHAN_OFFSET(ch)	(AD4630_REG_OFFSET_X0_2 + 3 * (ch))
 /* HARDWARE_GAIN */
 #define AD4630_REG_CHAN_GAIN(ch)	(AD4630_REG_GAIN_X0_MSB + 2 * (ch))
 #define AD4630_GAIN_MAX			1999970
+#define ADAQ4224_GAIN_MAX_NANO		6670000000
 /* POWER MODE*/
 #define AD4630_POWER_MODE_MSK		GENMASK(1, 0)
 #define AD4630_LOW_POWER_MODE		3
@@ -91,12 +94,21 @@
 /* sequence starting with "1 0 1" to enable reg access */
 #define AD4630_REG_ACCESS		0x2000
 /* Sampling timing */
+#define AD4630_TQUIET_CNV_DELAY_PS	9800
 #define AD4630_MAX_RATE_1_LANE		1750000
 #define AD4630_MAX_RATE			2000000
 
 #define AD4630_MAX_CHANNEL_NR		3
-#define AD4630_VREF_MIN			(4096 * 1000)
-#define AD4630_VREF_MAX			(5000 * 1000)
+#define AD4630_VREF_MIN			(4096 * MILLI)
+#define AD4630_VREF_MAX			(5000 * MILLI)
+
+#define AD4630_CHAN_INFO_NONE		0
+
+#define ADAQ4224_PGA_PINS		2
+#define ADAQ4224_PGA_1_BITMAP		0
+#define ADAQ4224_PGA_2_BITMAP		BIT(0)
+#define ADAQ4224_PGA_3_BITMAP		BIT(1)
+#define ADAQ4224_PGA_4_BITMAP		GENMASK(1, 0)
 
 enum {
 	AD4630_ONE_LANE_PER_CH,
@@ -122,8 +134,39 @@ enum {
 
 enum {
 	ID_AD4030_24,
+	ID_AD4032_24,
 	ID_AD4630_16,
+	ID_AD4632_16,
 	ID_AD4630_24,
+	ID_AD4632_24,
+	ID_ADAQ4216,
+	ID_ADAQ4220,
+	ID_ADAQ4224,
+};
+
+enum {
+	AD4630_033_GAIN = 0,
+	AD4630_056_GAIN = 1,
+	AD4630_222_GAIN = 2,
+	AD4630_667_GAIN = 3,
+	AD4630_MAX_PGA,
+};
+
+/*
+ * Gains computed as fractions of 1000 so they can be expressed by integers.
+ */
+static const int ad4630_gains[4] = {
+	330, 560, 2220, 6670
+};
+
+/*
+ * Gains stored and computed as fractions to avoid introducing rounding erros.
+ */
+static const int ad4630_gains_frac[4][2] = {
+	[AD4630_033_GAIN] = { 1, 3 },
+	[AD4630_056_GAIN] = { 5, 9 },
+	[AD4630_222_GAIN] = { 20, 9 },
+	[AD4630_667_GAIN] = { 20, 3 },
 };
 
 struct ad4630_out_mode {
@@ -141,6 +184,7 @@ struct ad4630_chip_info {
 	u16 base_word_len;
 	u8 grade;
 	u8 n_channels;
+	bool has_pga;
 };
 
 struct ad4630_state {
@@ -148,11 +192,14 @@ struct ad4630_state {
 	struct regulator_bulk_data regulators[3];
 	struct pwm_device *conv_trigger;
 	struct pwm_device *fetch_trigger;
+	struct gpio_descs *pga_gpios;
 	struct spi_device *spi;
 	struct regmap *regmap;
 
 	int vref;
 	int vio;
+	int pga_idx;
+	int scale_tbl[ARRAY_SIZE(ad4630_gains)][2];
 	unsigned int out_data;
 	unsigned int max_rate;
 
@@ -214,7 +261,7 @@ static void ad4630_get_sampling_freq(const struct ad4630_state *st, int *freq)
 	struct pwm_state conversion_state;
 
 	pwm_get_state(st->conv_trigger, &conversion_state);
-	*freq = DIV_ROUND_CLOSEST_ULL(1000000000000, conversion_state.period);
+	*freq = DIV_ROUND_CLOSEST_ULL(NANO, conversion_state.period);
 }
 
 static int ad4630_get_chan_gain(struct iio_dev *indio_dev, int ch, int *val)
@@ -278,6 +325,11 @@ static int ad4630_read_raw(struct iio_dev *indio_dev,
 		ad4630_get_sampling_freq(st, val);
 		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_SCALE:
+		if (st->chip->has_pga) {
+			*val = st->scale_tbl[st->pga_idx][0];
+			*val2 = st->scale_tbl[st->pga_idx][1];
+			return IIO_VAL_INT_PLUS_NANO;
+		}
 		*val = (st->vref * 2) / 1000;
 		*val2 = chan->scan_type.realbits;
 		return IIO_VAL_FRACTIONAL_LOG2;
@@ -300,18 +352,36 @@ static int ad4630_read_raw(struct iio_dev *indio_dev,
 	}
 }
 
+static int ad4630_read_avail(struct iio_dev *indio_dev,
+			     struct iio_chan_spec const *chan,
+			     const int **vals, int *type, int *length,
+			     long info)
+{
+	struct ad4630_state *st = iio_priv(indio_dev);
+
+	switch (info) {
+	case IIO_CHAN_INFO_SCALE:
+		*vals = (int *)st->scale_tbl;
+		*length = ARRAY_SIZE(ad4630_gains) * 2;
+		*type = IIO_VAL_INT_PLUS_NANO;
+		return IIO_AVAIL_LIST;
+	default:
+		return -EINVAL;
+	}
+}
+
 static int __ad4630_set_sampling_freq(const struct ad4630_state *st, unsigned int freq)
 {
 	struct pwm_state conv_state = {
-		.duty_cycle = 10000,
-		.time_unit = PWM_UNIT_PSEC,
+		.duty_cycle = 10,
+		.enabled = true,
 	}, fetch_state = {
-		.duty_cycle = 10000,
-		.time_unit = PWM_UNIT_PSEC,
+		.duty_cycle = 10,
+		.enabled = true,
 	};
 	int ret;
 
-	conv_state.period =  DIV_ROUND_CLOSEST_ULL(1000000000000, freq);
+	conv_state.period = DIV_ROUND_CLOSEST(NSEC_PER_SEC, freq);
 	ret = pwm_apply_state(st->conv_trigger, &conv_state);
 	if (ret)
 		return ret;
@@ -328,7 +398,7 @@ static int __ad4630_set_sampling_freq(const struct ad4630_state *st, unsigned in
 		if (ret)
 			return ret;
 
-		fetch_state.period *= 1 << avg;
+		fetch_state.period <<= FIELD_GET(AD4630_AVG_AVG_VAL, avg);
 	}
 
 	/*
@@ -337,7 +407,7 @@ static int __ad4630_set_sampling_freq(const struct ad4630_state *st, unsigned in
 	 * tsync + tquiet_con_delay being tsync the conversion signal period
 	 * and tquiet_con_delay 9.8ns. Hence set the PWM phase accordingly.
 	 */
-	fetch_state.phase = fetch_state.period + 9800;
+	fetch_state.phase = AD4630_TQUIET_CNV_DELAY_PS;
 
 	return pwm_apply_state(st->fetch_trigger, &fetch_state);
 }
@@ -386,6 +456,77 @@ static int ad4630_set_chan_offset(struct iio_dev *indio_dev, int ch, int offset)
 	return ret;
 }
 
+static void ad4630_fill_scale_tbl(struct ad4630_state *st)
+{
+	int val, val2, tmp0, tmp1, i;
+	u64 tmp2;
+
+	val2 = st->chip->modes[st->out_data].channels->scan_type.realbits;
+	for (i = 0; i < ARRAY_SIZE(ad4630_gains); i++) {
+		val = (st->vref * 2) / 1000;
+		/* Multiply by MILLI here to avoid losing precision */
+		val = mult_frac(val, ad4630_gains_frac[i][1] * MILLI,
+				ad4630_gains_frac[i][0]);
+		/* Would multiply by NANO here but we already multiplied by MILLI */
+		tmp2 = shift_right((u64)val * MICRO, val2);
+		tmp0 = (int)div_s64_rem(tmp2, NANO, &tmp1);
+		st->scale_tbl[i][0] = tmp0; /* Integer part */
+		st->scale_tbl[i][1] = abs(tmp1); /* Fractional part */
+	}
+}
+
+static int ad4630_calc_pga_gain(int gain_int, int gain_fract, int vref,
+				int precision)
+{
+	u64 gain_nano, tmp;
+	int gain_idx;
+
+	gain_nano = gain_int * NANO + gain_fract;
+
+	if (gain_nano < 0 || gain_nano > ADAQ4224_GAIN_MAX_NANO)
+		return -EINVAL;
+
+	tmp = DIV_ROUND_CLOSEST_ULL(gain_nano << precision, NANO);
+	gain_nano = DIV_ROUND_CLOSEST_ULL(vref * 2, tmp);
+	gain_idx = find_closest(gain_nano, ad4630_gains,
+				ARRAY_SIZE(ad4630_gains));
+
+	return gain_idx;
+}
+
+static int ad4630_set_pga_gain(struct iio_dev *indio_dev, int gain_idx)
+{
+	struct ad4630_state *st = iio_priv(indio_dev);
+	DECLARE_BITMAP(values, ADAQ4224_PGA_PINS);
+	int ret;
+
+	/* Set appropriate status for A0, A1 pins according to requested gain */
+	switch (gain_idx) {
+	case 0:
+		values[0] = ADAQ4224_PGA_1_BITMAP;
+		break;
+	case 1:
+		values[0] = ADAQ4224_PGA_2_BITMAP;
+		break;
+	case 2:
+		values[0] = ADAQ4224_PGA_3_BITMAP;
+		break;
+	case 3:
+		values[0] = ADAQ4224_PGA_4_BITMAP;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	ret = gpiod_set_array_value_cansleep(ADAQ4224_PGA_PINS,
+					     st->pga_gpios->desc,
+					     st->pga_gpios->info, values);
+	if (!ret)
+		st->pga_idx = gain_idx;
+
+	return ret;
+}
+
 static int ad4630_set_chan_gain(struct iio_dev *indio_dev, int ch,
 				int gain_int, int gain_frac)
 {
@@ -394,7 +535,7 @@ static int ad4630_set_chan_gain(struct iio_dev *indio_dev, int ch,
 	u64 gain;
 	int ret;
 
-	gain = gain_int * 1000000 + gain_frac;
+	gain = gain_int * MICRO + gain_frac;
 
 	if (gain < 0 || gain > AD4630_GAIN_MAX)
 		return -EINVAL;
@@ -412,13 +553,33 @@ static int ad4630_set_chan_gain(struct iio_dev *indio_dev, int ch,
 	return ret;
 }
 
+static int ad4630_write_raw_get_fmt(struct iio_dev *indio_dev,
+				    struct iio_chan_spec const *chan, long mask)
+{
+	switch (mask) {
+	case IIO_CHAN_INFO_SCALE:
+		return IIO_VAL_INT_PLUS_NANO;
+	default:
+		return IIO_VAL_INT_PLUS_MICRO;
+	}
+
+	return -EINVAL;
+}
+
 static int ad4630_write_raw(struct iio_dev *indio_dev,
 			    struct iio_chan_spec const *chan, int val,
 			    int val2, long info)
 {
+	struct ad4630_state *st = iio_priv(indio_dev);
+	int gain_idx;
+
 	switch (info) {
 	case IIO_CHAN_INFO_SAMP_FREQ:
 		return ad4630_set_sampling_freq(indio_dev, val);
+	case IIO_CHAN_INFO_SCALE:
+		gain_idx = ad4630_calc_pga_gain(val, val2, st->vref,
+						chan->scan_type.realbits);
+		return ad4630_set_pga_gain(indio_dev, gain_idx);
 	case IIO_CHAN_INFO_CALIBSCALE:
 		return ad4630_set_chan_gain(indio_dev, chan->channel, val,
 					    val2);
@@ -439,7 +600,7 @@ static int ad4630_update_sample_fetch_trigger(const struct ad4630_state *st, u32
 	pwm_get_state(st->conv_trigger, &conv_state);
 	pwm_get_state(st->fetch_trigger, &fetch_state);
 	fetch_state.period = conv_state.period * 1 << avg;
-	fetch_state.phase = fetch_state.period + 9800;
+	fetch_state.phase = AD4630_TQUIET_CNV_DELAY_PS;
 
 	return pwm_apply_state(st->fetch_trigger, &fetch_state);
 }
@@ -455,11 +616,11 @@ static int ad4630_set_avg_frame_len(struct iio_dev *dev,
 	if (ret)
 		return ret;
 
-	ret = regmap_write(st->regmap, AD4630_REG_AVG, avg_len);
+	ret = regmap_write(st->regmap, AD4630_REG_AVG, avg_len + 1);
 	if (ret)
 		goto out_error;
 
-	ret = ad4630_update_sample_fetch_trigger(st, avg_len);
+	ret = ad4630_update_sample_fetch_trigger(st, avg_len + 1);
 out_error:
 	iio_device_release_direct_mode(dev);
 
@@ -482,13 +643,7 @@ static int ad4630_get_avg_frame_len(struct iio_dev *dev,
 	if (ret)
 		return ret;
 
-	return avg_len;
-}
-
-static int ad4630_dma_buffer_submit_block(struct iio_dma_buffer_queue *queue,
-					  struct iio_dma_buffer_block *block)
-{
-	return iio_dmaengine_buffer_submit_block(queue, block, DMA_DEV_TO_MEM);
+	return avg_len - 1;
 }
 
 static int ad4630_sampling_enable(const struct ad4630_state *st, bool enable)
@@ -567,9 +722,13 @@ static int ad4630_buffer_preenable(struct iio_dev *indio_dev)
 	if (ret)
 		goto out_error;
 
+	ret = spi_optimize_message(st->spi, &st->offload_msg);
+	if (ret < 0)
+		goto out_error;
+
 	spi_bus_lock(st->spi->master);
-	spi_engine_offload_load_msg(st->spi, &st->offload_msg);
-	spi_engine_offload_enable(st->spi, true);
+	spi_engine_ex_offload_load_msg(st->spi, &st->offload_msg);
+	spi_engine_ex_offload_enable(st->spi, true);
 	ad4630_sampling_enable(st, true);
 
 	return 0;
@@ -589,9 +748,10 @@ static int ad4630_buffer_postdisable(struct iio_dev *indio_dev)
 	if (ret)
 		goto out_error;
 
-	spi_engine_offload_enable(st->spi, false);
+	spi_engine_ex_offload_enable(st->spi, false);
 	spi_bus_unlock(st->spi->master);
 
+	spi_unoptimize_message(&st->offload_msg);
 	ret = regmap_read(st->regmap, AD4630_REG_ACCESS, &dummy);
 out_error:
 	pm_runtime_mark_last_busy(&st->spi->dev);
@@ -600,7 +760,7 @@ out_error:
 }
 
 static const char *const ad4630_average_modes[] = {
-	"0", "2", "4", "8", "16", "32",	"64", "128", "256", "512", "1024",
+	"2", "4", "8", "16", "32", "64", "128", "256", "512", "1024",
 	"2048", "4096", "8192", "16384", "32768", "65536"
 };
 
@@ -614,14 +774,15 @@ static const struct iio_enum ad4630_avg_frame_len_enum = {
 static const struct iio_chan_spec_ext_info ad4630_ext_info[] = {
 	IIO_ENUM("sample_averaging", IIO_SHARED_BY_TYPE,
 		 &ad4630_avg_frame_len_enum),
-	IIO_ENUM_AVAILABLE_SHARED("sample_averaging", IIO_SHARED_BY_TYPE,
-				  &ad4630_avg_frame_len_enum),
+	IIO_ENUM_AVAILABLE("sample_averaging", IIO_SHARED_BY_TYPE,
+			   &ad4630_avg_frame_len_enum),
 	{}
 };
 
-#define AD4630_CHAN(_idx, _storage, _real, _shift, _info) {		\
+#define AD4630_CHAN(_idx, _msk_avail, _storage, _real, _shift, _info) {	\
 	.info_mask_separate = BIT(IIO_CHAN_INFO_CALIBSCALE) |		\
 			BIT(IIO_CHAN_INFO_CALIBBIAS),			\
+	.info_mask_separate_available = _msk_avail,			\
 	.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SAMP_FREQ),	\
 	.info_mask_shared_by_type =  BIT(IIO_CHAN_INFO_SCALE),		\
 	.type = IIO_VOLTAGE,						\
@@ -648,25 +809,26 @@ static const struct iio_chan_spec_ext_info ad4630_ext_info[] = {
 static const struct ad4630_out_mode ad4030_24_modes[] = {
 	[AD4630_24_DIFF] = {
 		.channels = {
-			AD4630_CHAN(0, 64, 24, 0, NULL),
+			AD4630_CHAN(0, AD4630_CHAN_INFO_NONE, 64, 24, 0, NULL),
 		},
 		.data_width = 24,
 	},
 	[AD4630_16_DIFF_8_COM] = {
 		.channels = {
-			AD4630_CHAN(0, 64, 16, 8, NULL),
+			AD4630_CHAN(0, AD4630_CHAN_INFO_NONE, 64, 16, 8, NULL),
 		},
 		.data_width = 24,
 	},
 	[AD4630_24_DIFF_8_COM] = {
 		.channels = {
-			AD4630_CHAN(0, 64, 24, 8, NULL),
+			AD4630_CHAN(0, AD4630_CHAN_INFO_NONE, 64, 24, 8, NULL),
 		},
 		.data_width = 32,
 	},
 	[AD4630_30_AVERAGED_DIFF] = {
 		.channels = {
-			AD4630_CHAN(0, 64, 30, 2, ad4630_ext_info),
+			AD4630_CHAN(0, AD4630_CHAN_INFO_NONE, 64, 30, 2,
+				    ad4630_ext_info),
 		},
 		.data_width = 32,
 	}
@@ -675,22 +837,24 @@ static const struct ad4630_out_mode ad4030_24_modes[] = {
 static const struct ad4630_out_mode ad4630_16_modes[] = {
 	[AD4630_16_DIFF] = {
 		.channels = {
-			AD4630_CHAN(0, 32, 16, 0, NULL),
-			AD4630_CHAN(1, 32, 16, 0, NULL),
+			AD4630_CHAN(0, AD4630_CHAN_INFO_NONE, 32, 16, 0, NULL),
+			AD4630_CHAN(1, AD4630_CHAN_INFO_NONE, 32, 16, 0, NULL),
 		},
 		.data_width = 16,
 	},
 	[AD4630_16_DIFF_8_COM] = {
 		.channels = {
-			AD4630_CHAN(0, 32, 16, 8, NULL),
-			AD4630_CHAN(1, 32, 16, 8, NULL),
+			AD4630_CHAN(0, AD4630_CHAN_INFO_NONE, 32, 16, 8, NULL),
+			AD4630_CHAN(1, AD4630_CHAN_INFO_NONE, 32, 16, 8, NULL),
 		},
 		.data_width = 24,
 	},
 	[AD4630_30_AVERAGED_DIFF] = {
 		.channels = {
-			AD4630_CHAN(0, 32, 30, 2, ad4630_ext_info),
-			AD4630_CHAN(1, 32, 30, 2, ad4630_ext_info),
+			AD4630_CHAN(0, AD4630_CHAN_INFO_NONE, 32, 30, 2,
+				    ad4630_ext_info),
+			AD4630_CHAN(1, AD4630_CHAN_INFO_NONE, 32, 30, 2,
+				    ad4630_ext_info),
 		},
 		.data_width = 32,
 	}
@@ -699,29 +863,100 @@ static const struct ad4630_out_mode ad4630_16_modes[] = {
 static const struct ad4630_out_mode ad4630_24_modes[] = {
 	[AD4630_24_DIFF] = {
 		.channels = {
-			AD4630_CHAN(0, 32, 24, 0, NULL),
-			AD4630_CHAN(1, 32, 24, 0, NULL),
+			AD4630_CHAN(0, AD4630_CHAN_INFO_NONE, 32, 24, 0, NULL),
+			AD4630_CHAN(1, AD4630_CHAN_INFO_NONE, 32, 24, 0, NULL),
 		},
 		.data_width = 24,
 	},
 	[AD4630_16_DIFF_8_COM] = {
 		.channels = {
-			AD4630_CHAN(0, 32, 16, 8, NULL),
-			AD4630_CHAN(1, 32, 16, 8, NULL),
+			AD4630_CHAN(0, AD4630_CHAN_INFO_NONE, 32, 16, 8, NULL),
+			AD4630_CHAN(1, AD4630_CHAN_INFO_NONE, 32, 16, 8, NULL),
 		},
 		.data_width = 24,
 	},
 	[AD4630_24_DIFF_8_COM] = {
 		.channels = {
-			AD4630_CHAN(0, 32, 24, 8, NULL),
-			AD4630_CHAN(1, 32, 24, 8, NULL),
+			AD4630_CHAN(0, AD4630_CHAN_INFO_NONE, 32, 24, 8, NULL),
+			AD4630_CHAN(1, AD4630_CHAN_INFO_NONE, 32, 24, 8, NULL),
 		},
 		.data_width = 32,
 	},
 	[AD4630_30_AVERAGED_DIFF] = {
 		.channels = {
-			AD4630_CHAN(0, 32, 30, 2, ad4630_ext_info),
-			AD4630_CHAN(1, 32, 30, 2, ad4630_ext_info),
+			AD4630_CHAN(0, AD4630_CHAN_INFO_NONE, 32, 30, 2,
+				    ad4630_ext_info),
+			AD4630_CHAN(1, AD4630_CHAN_INFO_NONE, 32, 30, 2,
+				    ad4630_ext_info),
+		},
+		.data_width = 32,
+	}
+};
+
+static const struct ad4630_out_mode adaq4216_modes[] = {
+	[AD4630_16_DIFF] = {
+		.channels = {
+			AD4630_CHAN(0, BIT(IIO_CHAN_INFO_SCALE), 64, 16, 0, NULL),
+		},
+		.data_width = 16,
+	},
+	[AD4630_16_DIFF_8_COM] = {
+		.channels = {
+			AD4630_CHAN(0, BIT(IIO_CHAN_INFO_SCALE), 64, 16, 8, NULL),
+		},
+		.data_width = 24,
+	},
+	[AD4630_30_AVERAGED_DIFF] = {
+		.channels = {
+			AD4630_CHAN(0, BIT(IIO_CHAN_INFO_SCALE), 64, 30, 2, ad4630_ext_info),
+		},
+		.data_width = 32,
+	}
+};
+
+static const struct ad4630_out_mode adaq4220_modes[] = {
+	[AD4630_16_DIFF] = {
+		.channels = {
+			AD4630_CHAN(0, BIT(IIO_CHAN_INFO_SCALE), 64, 20, 0, NULL),
+		},
+		.data_width = 20,
+	},
+	[AD4630_16_DIFF_8_COM] = {
+		.channels = {
+			AD4630_CHAN(0, BIT(IIO_CHAN_INFO_SCALE), 64, 16, 8, NULL),
+		},
+		.data_width = 24,
+	},
+	[AD4630_30_AVERAGED_DIFF] = {
+		.channels = {
+			AD4630_CHAN(0, BIT(IIO_CHAN_INFO_SCALE), 64, 30, 2, ad4630_ext_info),
+		},
+		.data_width = 32,
+	}
+};
+
+static const struct ad4630_out_mode adaq4224_modes[] = {
+	[AD4630_24_DIFF] = {
+		.channels = {
+			AD4630_CHAN(0, BIT(IIO_CHAN_INFO_SCALE), 64, 24, 0, NULL),
+		},
+		.data_width = 24,
+	},
+	[AD4630_16_DIFF_8_COM] = {
+		.channels = {
+			AD4630_CHAN(0, BIT(IIO_CHAN_INFO_SCALE), 64, 16, 8, NULL),
+		},
+		.data_width = 24,
+	},
+	[AD4630_24_DIFF_8_COM] = {
+		.channels = {
+			AD4630_CHAN(0, BIT(IIO_CHAN_INFO_SCALE), 64, 24, 8, NULL),
+		},
+		.data_width = 32,
+	},
+	[AD4630_30_AVERAGED_DIFF] = {
+		.channels = {
+			AD4630_CHAN(0, BIT(IIO_CHAN_INFO_SCALE), 64, 30, 2, ad4630_ext_info),
 		},
 		.data_width = 32,
 	}
@@ -751,12 +986,34 @@ static const struct ad4630_chip_info ad4630_chip_info[] = {
 		.base_word_len = 24,
 		.n_channels = 1,
 	},
+	[ID_AD4032_24] = {
+		.available_masks = ad4030_channel_masks,
+		.modes = ad4030_24_modes,
+		.out_modes_mask = GENMASK(3, 0),
+		.name = "ad4032-24",
+		.grade = 0x12,
+		.min_offset = (int)BIT(23) * -1,
+		.max_offset = BIT(23) - 1,
+		.base_word_len = 24,
+		.n_channels = 1,
+	},
 	[ID_AD4630_16] = {
 		.available_masks = ad4630_channel_masks,
 		.modes = ad4630_16_modes,
 		.out_modes_mask = BIT(3) | GENMASK(1, 0),
 		.name = "ad4630-16",
 		.grade = 0x03,
+		.min_offset = (int)BIT(15) * -1,
+		.max_offset = BIT(15) - 1,
+		.base_word_len = 16,
+		.n_channels = 2,
+	},
+	[ID_AD4632_16] = {
+		.available_masks = ad4630_channel_masks,
+		.modes = ad4630_16_modes,
+		.out_modes_mask = BIT(3) | GENMASK(1, 0),
+		.name = "ad4632-16",
+		.grade = 0x05,
 		.min_offset = (int)BIT(15) * -1,
 		.max_offset = BIT(15) - 1,
 		.base_word_len = 16,
@@ -771,37 +1028,55 @@ static const struct ad4630_chip_info ad4630_chip_info[] = {
 		.max_offset = BIT(23) - 1,
 		.base_word_len = 24,
 		.n_channels = 2,
+	},
+	[ID_AD4632_24] = {
+		.available_masks = ad4630_channel_masks,
+		.modes = ad4630_24_modes,
+		.out_modes_mask = GENMASK(3, 0),
+		.name = "ad4632-24",
+		.grade = 0x2,
+		.min_offset = (int)BIT(23) * -1,
+		.max_offset = BIT(23) - 1,
+		.base_word_len = 24,
+		.n_channels = 2,
+	},
+	[ID_ADAQ4216] = {
+		.available_masks = ad4030_channel_masks,
+		.modes = adaq4216_modes,
+		.out_modes_mask = GENMASK(3, 0),
+		.name = "adaq4216",
+		.grade = 0x1E,
+		.min_offset = (int)BIT(15) * -1,
+		.max_offset = BIT(15) - 1,
+		.base_word_len = 16,
+		.has_pga = true,
+		.n_channels = 1,
+	},
+	[ID_ADAQ4220] = {
+		.available_masks = ad4030_channel_masks,
+		.modes = adaq4220_modes,
+		.out_modes_mask = GENMASK(3, 0),
+		.name = "adaq4220",
+		.grade = 0x1D,
+		.min_offset = (int)BIT(19) * -1,
+		.max_offset = BIT(19) - 1,
+		.base_word_len = 20,
+		.has_pga = true,
+		.n_channels = 1,
+	},
+	[ID_ADAQ4224] = {
+		.available_masks = ad4030_channel_masks,
+		.modes = adaq4224_modes,
+		.out_modes_mask = GENMASK(3, 0),
+		.name = "adaq4224",
+		.grade = 0x1C,
+		.min_offset = (int)BIT(23) * -1,
+		.max_offset = BIT(23) - 1,
+		.base_word_len = 24,
+		.has_pga = true,
+		.n_channels = 1,
 	}
 };
-
-static const struct ad4630_chip_info ad463x_chip_info = {
-	.name = "ad463x"
-};
-
-static int ad4630_detect_chip_info(struct ad4630_state *st)
-{
-	int ret, c;
-	u32 grade;
-
-	ret = regmap_read(st->regmap, AD4630_REG_CHIP_GRADE, &grade);
-	if (ret)
-		return ret;
-
-	grade = FIELD_GET(AD4630_MSK_CHIP_GRADE, grade);
-
-	for (c = 0; c < ARRAY_SIZE(ad4630_chip_info); c++) {
-		if (ad4630_chip_info[c].grade == grade)
-			break;
-	}
-
-	if (c == ARRAY_SIZE(ad4630_chip_info))
-		return dev_err_probe(&st->spi->dev, -EINVAL,
-				     "Unknown grade(%u)\n", grade);
-
-	st->chip = &ad4630_chip_info[c];
-
-	return 0;
-}
 
 static void ad4630_clk_disable(void *data)
 {
@@ -876,7 +1151,7 @@ static int ad4630_regulators_get(struct ad4630_state *st)
 
 	st->vref = regulator_get_voltage(ref);
 	if (st->vref < AD4630_VREF_MIN || st->vref > AD4630_VREF_MAX)
-		return dev_err_probe(dev, -EINVAL, "vref(%d) must be under [%u %u]\n",
+		return dev_err_probe(dev, -EINVAL, "vref(%d) must be under [%lu %lu]\n",
 				     st->vref, AD4630_VREF_MIN, AD4630_VREF_MAX);
 
 	return 0;
@@ -950,7 +1225,6 @@ static void ad4630_prepare_spi_sampling_msg(struct ad4630_state *st,
 	 */
 	st->offload_xfer.speed_hz = AD4630_SPI_SAMPLING_SPEED;
 	st->offload_xfer.rx_buf = (void *)-1;
-	st->offload_xfer.len = 1;
 
 	/*
 	 * In host mode, for a 16-bit data-word, the device adds an additional
@@ -976,27 +1250,25 @@ static void ad4630_prepare_spi_sampling_msg(struct ad4630_state *st,
 	}
 
 	st->offload_xfer.bits_per_word = st->bits_per_word;
+	st->offload_xfer.len = roundup_pow_of_two(BITS_TO_BYTES(st->bits_per_word));
+
 	spi_message_init_with_transfers(&st->offload_msg, &st->offload_xfer, 1);
 }
 
 static int ad4630_config(struct ad4630_state *st)
 {
-	u32 clock_mode = 0, lane_mode = 0, reg_modes = 0;
+	u32 clock_mode = 0, lane_mode = 0, reg_modes = 0, grade;
 	bool data_rate;
 	struct device *dev = &st->spi->dev;
 	int ret;
 
-	/*
-	 * !FIXME: This looks very hacky... We need to check with the BU
-	 * what's the usecase for this and how can we handle it before removing
-	 * this code. If there's a valid usecase for it, we need to check upstream
-	 * how can this be handled.
-	 */
-	if (!strcmp(st->chip->name, "ad463x")) {
-		ret = ad4630_detect_chip_info(st);
-		if (ret)
-			return ret;
-	}
+	ret = regmap_read(st->regmap, AD4630_REG_CHIP_GRADE, &grade);
+	if (ret)
+		return ret;
+
+	if (st->chip->grade != FIELD_GET(AD4630_MSK_CHIP_GRADE, grade))
+		dev_warn(dev, "Unknown grade(%u). Expected(%u)\n", grade,
+			 st->chip->grade);
 
 	ret = device_property_read_u32(dev, "adi,lane-mode", &lane_mode);
 	if (!ret) {
@@ -1050,21 +1322,12 @@ static int ad4630_config(struct ad4630_state *st)
 	if (ret)
 		return ret;
 
-	if (lane_mode == AD4630_ONE_LANE_PER_CH && data_rate &&
-	    st->chip->modes[st->out_data].data_width == 32)
-		st->max_rate = AD4630_MAX_RATE_1_LANE;
-	else
-		st->max_rate = AD4630_MAX_RATE;
+	st->max_rate = AD4630_MAX_RATE;
 
 	ad4630_prepare_spi_sampling_msg(st, clock_mode, lane_mode, data_rate);
 
 	return 0;
 }
-
-static const struct iio_dma_buffer_ops ad4630_dma_buffer_ops = {
-	.submit = ad4630_dma_buffer_submit_block,
-	.abort = iio_dmaengine_buffer_abort,
-};
 
 static const struct iio_buffer_setup_ops ad4630_buffer_setup_ops = {
 	.preenable = &ad4630_buffer_preenable,
@@ -1073,7 +1336,9 @@ static const struct iio_buffer_setup_ops ad4630_buffer_setup_ops = {
 
 static const struct iio_info ad4630_info = {
 	.read_raw = &ad4630_read_raw,
+	.read_avail = &ad4630_read_avail,
 	.write_raw = &ad4630_write_raw,
+	.write_raw_get_fmt = &ad4630_write_raw_get_fmt,
 	.debugfs_reg_access = &ad4630_reg_access,
 };
 
@@ -1198,7 +1463,6 @@ static int ad4630_probe(struct spi_device *spi)
 {
 	struct device *dev = &spi->dev;
 	struct iio_dev *indio_dev;
-	struct iio_buffer *buffer;
 	struct clk *trigger_clock;
 	struct ad4630_state *st;
 	int ret;
@@ -1209,15 +1473,12 @@ static int ad4630_probe(struct spi_device *spi)
 
 	st = iio_priv(indio_dev);
 	st->spi = spi;
-	spi_set_drvdata(spi, indio_dev);
+	spi_set_drvdata(spi, st);
 
-	st->chip = device_get_match_data(dev);
-	if (!st->chip) {
-		st->chip = (void *)spi_get_device_id(spi)->driver_data;
-		if (!st->chip)
-			return dev_err_probe(dev, -ENODEV,
-					     "Could not find chip info data\n");
-	}
+	st->chip = spi_get_device_match_data(spi);
+	if (!st->chip)
+		return dev_err_probe(dev, -ENODEV,
+				     "Could not find chip info data\n");
 
 	st->regmap = devm_regmap_init(&spi->dev, &ad4630_regmap_bus, st,
 				      &ad4630_regmap_config);
@@ -1243,17 +1504,39 @@ static int ad4630_probe(struct spi_device *spi)
 	if (ret)
 		return ret;
 
+	st->pga_gpios = devm_gpiod_get_array_optional(&spi->dev, "adi,pga",
+						      GPIOD_OUT_LOW);
+
+	if (IS_ERR(st->pga_gpios))
+		dev_err_probe(&spi->dev, PTR_ERR(st->pga_gpios),
+			      "Failed to get PGA GPIOs\n");
+
 	ret = ad4630_reset(st);
 	if (ret)
 		return ret;
 
 	ret = ad4630_config(st);
 	if (ret)
+		return dev_err_probe(&spi->dev, ret,
+				     "Config failed: %d\n", ret);
+
+	if (st->pga_gpios) {
+		ad4630_fill_scale_tbl(st);
+		ad4630_set_pga_gain(indio_dev, 0);
+	}
+
+	/*
+	 * Due to a hardware bug in some chips when using average mode zero
+	 * (no averaging), set default averaging mode to 2 samples.
+	 */
+	ret = regmap_write(st->regmap, AD4630_REG_AVG, 0x01);
+	if (ret)
 		return ret;
 
 	ret = ad4630_pwm_get(st);
 	if (ret)
-		return ret;
+		return dev_err_probe(&spi->dev, ret,
+				     "Failed to get PWM: %d\n", ret);
 
 	indio_dev->name = st->chip->name;
 	indio_dev->info = &ad4630_info;
@@ -1263,13 +1546,11 @@ static int ad4630_probe(struct spi_device *spi)
 	indio_dev->available_scan_masks = st->chip->available_masks;
 	indio_dev->setup_ops = &ad4630_buffer_setup_ops;
 
-	buffer = devm_iio_dmaengine_buffer_alloc(dev, "rx",
-						 &ad4630_dma_buffer_ops, NULL);
-	if (IS_ERR(buffer))
-		return dev_err_probe(dev, PTR_ERR(buffer),
+	ret = devm_iio_dmaengine_buffer_setup(dev, indio_dev, "rx",
+					      IIO_BUFFER_DIRECTION_IN);
+	if (ret)
+		return dev_err_probe(dev, ret,
 				     "Failed to get DMA buffer\n");
-
-	iio_device_attach_buffer(indio_dev, buffer);
 
 	pm_runtime_set_autosuspend_delay(dev, 1000);
 	pm_runtime_use_autosuspend(dev);
@@ -1290,19 +1571,17 @@ static int ad4630_probe(struct spi_device *spi)
 	return 0;
 }
 
-static int __maybe_unused ad4630_runtime_suspend(struct device *dev)
+static int ad4630_runtime_suspend(struct device *dev)
 {
 	u32 val = FIELD_PREP(AD4630_POWER_MODE_MSK, AD4630_LOW_POWER_MODE);
-	struct iio_dev *indio_dev = dev_get_drvdata(dev);
-	struct ad4630_state *st = iio_priv(indio_dev);
+	struct ad4630_state *st = dev_get_drvdata(dev);
 
 	return regmap_write(st->regmap, AD4630_REG_DEVICE_CONFIG, val);
 }
 
-static int __maybe_unused ad4630_runtime_resume(struct device *dev)
+static int ad4630_runtime_resume(struct device *dev)
 {
-	struct iio_dev *indio_dev = dev_get_drvdata(dev);
-	struct ad4630_state *st = iio_priv(indio_dev);
+	struct ad4630_state *st = dev_get_drvdata(dev);
 	int ret;
 
 	ret = regmap_write(st->regmap, AD4630_REG_DEVICE_CONFIG,
@@ -1321,18 +1600,28 @@ static const struct dev_pm_ops ad4630_pm_ops = {
 
 static const struct spi_device_id ad4630_id_table[] = {
 	{ "ad4030-24", (kernel_ulong_t)&ad4630_chip_info[ID_AD4030_24] },
+	{ "ad4032-24", (kernel_ulong_t)&ad4630_chip_info[ID_AD4032_24] },
 	{ "ad4630-16", (kernel_ulong_t)&ad4630_chip_info[ID_AD4630_16] },
+	{ "ad4632-16", (kernel_ulong_t)&ad4630_chip_info[ID_AD4632_16] },
 	{ "ad4630-24", (kernel_ulong_t)&ad4630_chip_info[ID_AD4630_24] },
-	{ "ad463x", (kernel_ulong_t)&ad463x_chip_info },
+	{ "ad4632-24", (kernel_ulong_t)&ad4630_chip_info[ID_AD4632_24] },
+	{ "adaq4216", (kernel_ulong_t)&ad4630_chip_info[ID_ADAQ4216] },
+	{ "adaq4220", (kernel_ulong_t)&ad4630_chip_info[ID_ADAQ4220] },
+	{ "adaq4224", (kernel_ulong_t)&ad4630_chip_info[ID_ADAQ4224] },
 	{}
 };
 MODULE_DEVICE_TABLE(spi, ad4630_id_table);
 
 static const struct of_device_id ad4630_of_match[] = {
 	{ .compatible = "adi,ad4030-24", .data = &ad4630_chip_info[ID_AD4030_24] },
+	{ .compatible = "adi,ad4032-24", .data = &ad4630_chip_info[ID_AD4032_24] },
 	{ .compatible = "adi,ad4630-16", .data = &ad4630_chip_info[ID_AD4630_16] },
+	{ .compatible = "adi,ad4632-16", .data = &ad4630_chip_info[ID_AD4632_16] },
 	{ .compatible = "adi,ad4630-24", .data = &ad4630_chip_info[ID_AD4630_24] },
-	{ .compatible = "adi,ad463x", .data = &ad463x_chip_info},
+	{ .compatible = "adi,ad4632-24", .data = &ad4630_chip_info[ID_AD4632_24] },
+	{ .compatible = "adi,adaq4216", .data = &ad4630_chip_info[ID_ADAQ4216] },
+	{ .compatible = "adi,adaq4220", .data = &ad4630_chip_info[ID_ADAQ4220] },
+	{ .compatible = "adi,adaq4224", .data = &ad4630_chip_info[ID_ADAQ4224] },
 	{}
 };
 MODULE_DEVICE_TABLE(of, ad4630_of_match);
@@ -1341,7 +1630,7 @@ static struct spi_driver ad4630_driver = {
 	.driver = {
 		.name = "ad4630",
 		.of_match_table = ad4630_of_match,
-		.pm = &ad4630_pm_ops,
+		.pm = pm_ptr(&ad4630_pm_ops),
 	},
 	.probe = ad4630_probe,
 	.id_table = ad4630_id_table,
@@ -1350,5 +1639,8 @@ module_spi_driver(ad4630_driver);
 
 MODULE_AUTHOR("Sergiu Cuciurean <sergiu.cuciurean@analog.com>");
 MODULE_AUTHOR("Nuno Sa <nuno.sa@analog.com>");
-MODULE_DESCRIPTION("Analog Devices AD4630 ADC family driver");
+MODULE_AUTHOR("Marcelo Schmitt <marcelo.schmitt@analog.com>");
+MODULE_AUTHOR("Liviu Adace <liviu.adace@analog.com>");
+MODULE_DESCRIPTION("Analog Devices AD4630 and ADAQ4224 ADC family driver");
 MODULE_LICENSE("GPL v2");
+MODULE_IMPORT_NS(IIO_DMAENGINE_BUFFER);

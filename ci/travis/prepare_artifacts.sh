@@ -10,6 +10,7 @@ artifacts_structure() {
 	cd ${SOURCE_DIRECTORY}
 	mkdir ${timestamp}
 
+	echo "git_branch=${BUILD_SOURCEBRANCHNAME}" >> ${timestamp}/rpi_git_properties.txt
 	echo "git_sha=${GIT_SHA}" >> ${timestamp}/rpi_git_properties.txt
 	echo "git_sha_date=${GIT_SHA_DATE}" >> ${timestamp}/rpi_git_properties.txt
 
@@ -31,35 +32,38 @@ artifacts_structure() {
 
 #upload artifacts to Artifactory
 artifacts_artifactory() {
+	artifacts_structure
 	cd ${SOURCE_DIRECTORY}
 	python ../ci/travis/upload_to_artifactory.py --base_path="${ARTIFACTORY_PATH}" \
-		--server_path="linux_rpi/${BUILD_SOURCEBRANCHNAME}" --local_path="${timestamp}" --token="${ARTIFACTORY_TOKEN}"
+		--server_path="linux_rpi/${BUILD_SOURCEBRANCHNAME}" --local_path="${timestamp}" \
+		--token="${ARTIFACTORY_TOKEN}" --log_file="upload_to_artifactory.log"
 }
 
 #archive artifacts and upload to SWDownloads
 artifacts_swdownloads() {
+	artifacts_structure
 	cd ${SOURCE_DIRECTORY}/${timestamp} || exit 1
 	chmod 600 ${KEY_FILE}
 	scp -2 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-dss \
-		-i ${KEY_FILE} -r *.tar.gz ${DEST_SERVER}
+		-i ${KEY_FILE} -r *.tar.gz ${DEST_SERVER}/${BUILD_SOURCEBRANCHNAME}
 	md5_modules=($(md5sum rpi_modules.tar.gz| cut -d ' ' -f 1))
 
 	rm rpi_modules.tar.gz rpi_git_properties.txt
 	tar -C ${PWD} -czvf rpi_latest_boot.tar.gz *
 	md5_boot=($(md5sum rpi_latest_boot.tar.gz| cut -d ' ' -f 1))
 	scp -2 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-dss \
-	    -i ${KEY_FILE} -r rpi_latest_boot.tar.gz ${DEST_SERVER}
+	    -i ${KEY_FILE} -r rpi_latest_boot.tar.gz ${DEST_SERVER}/${BUILD_SOURCEBRANCHNAME}
 
-	echo "boot_date=${timestamp}" >> rpi_archives_properties.txt
+	echo "git_branch=${BUILD_SOURCEBRANCHNAME}" >> rpi_archives_properties.txt
 	echo "https://swdownloads.analog.com/cse/linux_rpi/${BUILD_SOURCEBRANCHNAME}/rpi_modules.tar.gz" >> rpi_archives_properties.txt
 	echo "https://swdownloads.analog.com/cse/linux_rpi/${BUILD_SOURCEBRANCHNAME}/rpi_latest_boot.tar.gz" >> rpi_archives_properties.txt
 	echo "checksum_modules=${md5_modules}" >> rpi_archives_properties.txt
 	echo "checksum_boot_files=${md5_boot}" >> rpi_archives_properties.txt
 	echo "git_sha=${GIT_SHA}" >> rpi_archives_properties.txt
-        echo "git_sha_date=${GIT_SHA_DATE}" >> rpi_archives_properties.txt
+	echo "git_sha_date=${GIT_SHA_DATE}" >> rpi_archives_properties.txt
 
 	scp -2 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-dss \
-                -i ${KEY_FILE} -r rpi_archives_properties.txt ${DEST_SERVER}
+                -i ${KEY_FILE} -r rpi_archives_properties.txt ${DEST_SERVER}/${BUILD_SOURCEBRANCHNAME}
 }
 
 artifacts_${1}

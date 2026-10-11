@@ -29,6 +29,7 @@
 
 	aliases {
 		serial0 = &serial0;
+		serial2 = &dcc;
 		i2c0 = &i2c0;
 		i2c1 = &i2c1;
 		mmc0 = &sdhci1;
@@ -73,6 +74,7 @@
 		spi-tx-bus-width = <8>;
 		spi-rx-bus-width = <8>;
 		spi-max-frequency = <20000000>;
+		no-wp;
 		partition@0 {
 			label = "spi0-flash0";
 			reg = <0 0x8000000>;
@@ -82,8 +84,6 @@
 
 &usb0 { /* PMC_MIO13_500 - PMC_MIO25 USB 2.0 */
 	status = "okay";
-	xlnx,usb-polarity = <0>;
-	xlnx,usb-reset-mode = <0>;
 };
 
 &dwc3_0 { /* USB 2.0 host */
@@ -107,12 +107,10 @@
 
 &i2c0 { /* PMC_MIO46/47 */
 	status = "okay";
-	clock-frequency = <400000>;
 };
 
 &i2c1 { /* PMC_MIO44/45 */
 	status = "okay";
-	clock-frequency = <400000>;
 };
 
 &dcc {

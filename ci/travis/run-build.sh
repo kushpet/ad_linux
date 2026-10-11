@@ -6,21 +6,29 @@ if [ -d /docker_build_dir ] ; then
 	cd /docker_build_dir
 fi
 
-. ./ci/travis/lib.sh
+[ "${LOCAL_BUILD}" == "y" ] || . ./ci/travis/lib.sh
 
-MAIN_BRANCH=${MAIN_BRANCH:-master}
+__echo_green() {
+	[ "${LOCAL_BUILD}" == "y" ] && echo $@ || echo_green $@
+}
 
-if [ -f "${FULL_BUILD_DIR}/env" ] ; then
+__echo_red() {
+	[ "${LOCAL_BUILD}" == "y" ] && echo $@ || echo_red $@
+}
+
+MAIN_BRANCH=${MAIN_BRANCH:-main}
+
+if [ -f "${FULL_BUILD_DIR}/env" ] && [ -z "${LOCAL_BUILD}" ]; then
 	echo_blue "Loading environment variables"
 	cat "${FULL_BUILD_DIR}/env"
 	. "${FULL_BUILD_DIR}/env"
 fi
 
 # Run once for the entire script
-sudo apt-get -qq update
+[ "${LOCAL_BUILD}" == "y" ] || sudo apt-get -qq update
 
 apt_install() {
-	sudo apt-get install -y $@
+	[ "${LOCAL_BUILD}" == "y" ] || sudo apt-get install -y $@
 }
 
 if [ -z "$NUM_JOBS" ] ; then
@@ -56,7 +64,7 @@ adjust_kcflags_against_gcc() {
 	export KCFLAGS
 }
 
-APT_LIST="make bc u-boot-tools flex bison libssl-dev tar kmod"
+APT_LIST="make bc u-boot-tools flex bison libssl-dev tar kmod xz-utils"
 
 if [ "$ARCH" = "arm64" ] ; then
 	if [ -z "$CROSS_COMPILE" ] ; then
@@ -85,6 +93,11 @@ __get_all_c_files() {
 	git grep -i "$@" | cut -d: -f1 | sort | uniq  | grep "\.c"
 }
 
+__exceptions_file() {
+	[ ! -f "$1" ] && return 1
+	grep -q "$2" "$1" && return 0 || return 1
+}
+
 check_all_adi_files_have_been_built() {
 	# Collect all .c files that contain the 'Analog Devices' string/name
 	local c_files=$(__get_all_c_files "Analog Devices")
@@ -98,30 +111,29 @@ check_all_adi_files_have_been_built() {
 	# Convert them to .o files via sed, and extract only the filenames
 	for file in $c_files ; do
 		file1=$(echo $file | sed 's/\.c/\.o/g')
-		if [ -f "$exceptions_file" ] ; then
-			if grep -q "$file1" "$exceptions_file" ; then
-				continue
-			fi
+		if __exceptions_file "$exceptions_file" "$file1"; then
+			continue
 		fi
+
 		if [ ! -f "$file1" ] ; then
 			if [ "$ret" = "0" ] ; then
 				echo
-				echo_red "The following files need to be built OR"
-				echo_green "      added to '$exceptions_file'"
+				__echo_red "The following files need to be built OR"
+				__echo_green "      added to '$exceptions_file'"
 
 				echo
 
-				echo_green "  If adding the '$exceptions_file', please make sure"
-				echo_green "  to check if it's better to add the correct Kconfig symbol"
-				echo_green "  to one of the following files:"
+				__echo_green "  If adding the '$exceptions_file', please make sure"
+				__echo_green "  to check if it's better to add the correct Kconfig symbol"
+				__echo_green "  to one of the following files:"
 
 				for file in $(find -name Kconfig.adi) ; do
-					echo_green "   $file"
+					__echo_green "   $file"
 				done
 
 				echo
 			fi
-			echo_red "File '$file1' has not been compiled"
+			__echo_red "File '$file1' has not been compiled"
 			ret=1
 		fi
 	done
@@ -141,34 +153,44 @@ get_ref_branch() {
 	fi
 }
 
-build_check_is_new_adi_driver_dual_licensed() {
+bad_licence_error() {
+       __echo_red "File '$1' is being added to Analog Devices Linux tree."
+       __echo_red "Analog Devices code is being marked dual-licensed... Make sure this is really intended!"
+       __echo_red "If not intended, change MODULE_LICENSE() or the SPDX-License-Identifier accordingly."
+       __echo_red "This is not as simple as one thinks and upstream might require a lawyer to sign the patches!"
+}
+
+build_check_new_file_license() {
 	local ret
 
 	local ref_branch="$(get_ref_branch)"
 
 	if [ -z "$ref_branch" ] ; then
-		echo_red "Could not get a base_ref for checkpatch"
+		__echo_red "Could not get a base_ref for checkpatch"
 		exit 1
 	fi
 
+	__update_git_ref "${ref_branch}" "${ref_branch}"
+
 	COMMIT_RANGE="${ref_branch}.."
 
-	echo_green "Running checkpatch for commit range '$COMMIT_RANGE'"
+	__echo_green "Running check_new_adi_file_license for commit range '$COMMIT_RANGE'"
 
 	ret=0
-	# Get list of files in the commit range
-	for file in $(git diff --name-only "$COMMIT_RANGE") ; do
-		if git diff "$COMMIT_RANGE" "$file" | grep -q "+MODULE_LICENSE" ; then
-			# Check that it has an 'Analog Devices' string
-			if ! grep -q "Analog Devices" "$file" ; then
+	# Get list of new files in the commit range
+	for file in $(git diff --name-status "$COMMIT_RANGE" | grep ^A | cut -d$'\t' -f2) ; do
+		if git diff "$COMMIT_RANGE" "$file" | grep "+MODULE_LICENSE" | grep -q "Dual" ; then
+			bad_licence_error "$file"
+			ret=1
+		elif git diff "$COMMIT_RANGE" "$file" | grep "SPDX-License-Identifier:" | grep -qi " OR " ; then
+			# The below might catch bad licenses in header files and also helps to make sure dual licenses are
+			# not in driver (eg: sometimes people have MODULE_LICENSE != SPDX-License-Identifier - which is also
+			# wrong and maybe someting to improve in this job)
+			if echo "$file" | grep -q ".yaml$"; then
 				continue
 			fi
-			if git diff "$COMMIT_RANGE" "$file" | grep "+MODULE_LICENSE" | grep -v "Dual" ; then
-				echo_red "File '$file' contains new Analog Devices' driver"
-				echo_red "New 'Analog Devices' drivers must be dual-licensed, with a license being BSD"
-				echo_red " Example: MODULE_LICENSE(Dual BSD/GPL)"
-				ret=1
-			fi
+			bad_licence_error "$file"
+			ret=1
 		fi
 	done
 
@@ -183,12 +205,12 @@ __setup_dummy_git_account() {
 
 build_default() {
 	[ -n "$DEFCONFIG" ] || {
-		echo_red "No DEFCONFIG provided"
+		__echo_red "No DEFCONFIG provided"
 		return 1
 	}
 
 	[ -n "$ARCH" ] || {
-		echo_red "No ARCH provided"
+		__echo_red "No ARCH provided"
 		return 1
 	}
 
@@ -251,8 +273,8 @@ build_default() {
 	mv defconfig arch/$ARCH/configs/$DEFCONFIG
 
 	git diff --exit-code || {
-		echo_red "Defconfig file should be updated: 'arch/$ARCH/configs/$DEFCONFIG'"
-		echo_red "Run 'make savedefconfig', overwrite it and commit it"
+		__echo_red "Defconfig file should be updated: 'arch/$ARCH/configs/$DEFCONFIG'"
+		__echo_red "Run 'make savedefconfig', overwrite it and commit it"
 		return 1
 	}
 }
@@ -268,24 +290,25 @@ build_allmodconfig() {
 build_checkpatch() {
 	local ref_branch="$(get_ref_branch)"
 
-	echo_green "Running checkpatch for commit range '$ref_branch..'"
+	__echo_green "Running checkpatch for commit range '$ref_branch..'"
 
 	if [ -z "$ref_branch" ] ; then
-		echo_red "Could not get a base_ref for checkpatch"
+		__echo_red "Could not get a base_ref for checkpatch"
 		exit 1
 	fi
 
 	# install checkpatch dependencies
-	sudo pip install ply GitPython
+	[ "${LOCAL_BUILD}" == "y" ] || sudo pip install ply GitPython
 
 	# __update_git_ref() does a shallow fetch with depth=50 by default to speed things
 	# up. However that could be problematic if the branch in the PR diverged from
-	# master such that we cannot find a common ancestor. In that case, the job will
+	# main/master such that we cannot find a common ancestor. In that case, the job will
 	# timeout after 60min even if the branch is able to merge (even if diverged). We
 	# could do '$GIT_FETCH_DEPTH="disable"' before calling __update_git_ref() but that
 	# would slow things a lot. Instead, let's do a treeless fetch which get's the whole
 	# history while being much faster than a typical fetch.
-	git fetch --filter=tree:0 --no-tags ${ORIGIN} +refs/heads/${ref_branch}:${ref_branch}
+	[ "${LOCAL_BUILD}" == "y" ] || \
+                git fetch --filter=tree:0 --no-tags ${ORIGIN} +refs/heads/${ref_branch}:${ref_branch}
 
 	scripts/checkpatch.pl --git "${ref_branch}.." \
 		--strict \
@@ -303,15 +326,15 @@ build_dt_binding_check() {
 	local commit="$COMMIT"
 	local err=0
 
-	echo_green "Running dt_binding_check for commit range '$ref_branch..'"
+	__echo_green "Running dt_binding_check for commit range '$ref_branch..'"
 
 	if [ -z "$ref_branch" ] ; then
-		echo_red "Could not get a base_ref for checkpatch"
+		__echo_red "Could not get a base_ref for checkpatch"
 		exit 1
 	fi
 
 	# install dt_binding_check dependencies
-	pip3 install git+https://github.com/devicetree-org/dt-schema.git@master
+	[ "${LOCAL_BUILD}" == "y" ] || pip3 install dtschema
 
 	__update_git_ref "${ref_branch}" "${ref_branch}"
 
@@ -340,7 +363,7 @@ build_dt_binding_check() {
 				# manually, and set err if the exit-code is non-zero,
 				# before enabling exit-on-error back.
 				set +e
-				error_txt=$(make dt_binding_check DT_CHECKER_FLAGS=-m DT_SCHEMA_FILES="$relative_yaml" 2>&1)
+				error_txt=$(make dt_binding_check CONFIG_DTC=y DT_CHECKER_FLAGS=-m DT_SCHEMA_FILES="$relative_yaml" 2>&1)
 				if [[ $? -ne 0 ]]; then
 					err=1
 				fi
@@ -372,19 +395,34 @@ build_dtb_build_test() {
 		if [ "$arch" != "arm" ] && [ "$arch" != "arm64" ] ; then
 			continue
 		fi
-		if [ -f "$exceptions_file" ] ; then
-			if grep -q "$file" "$exceptions_file" ; then
-				continue
-			fi
+
+		if __exceptions_file "$exceptions_file" "$file"; then
+			continue
 		fi
+
 		if ! grep -q "hdl_project:" $file ; then
-			echo_red "'$file' doesn't contain an 'hdl_project:' tag"
+			__echo_red "'$file' doesn't contain an 'hdl_project:' tag"
 			err=1
 			hdl_project_tag_err=1
 		fi
 	done
 
+	if [ "$hdl_project_tag_err" = "1" ] ; then
+		echo
+		echo
+		__echo_green "Some DTs have been found that do not contain an 'hdl_project:' tag"
+		__echo_green "   Either:"
+		__echo_green "     1. Create a 'hdl_project' tag for it"
+		__echo_green "     OR"
+		__echo_green "     1. add it in file '$exceptions_file'"
+		return 1
+	fi
+
 	for file in $DTS_FILES; do
+		if __exceptions_file "$exceptions_file" "$file"; then
+			continue
+		fi
+
 		dtb_file=$(echo $file | sed 's/dts\//=/g' | cut -d'=' -f2 | sed 's\dts\dtb\g')
 		arch=$(echo $file |  cut -d'/' -f2)
 		if [ "$last_arch" != "$arch" ] ; then
@@ -400,18 +438,8 @@ build_dtb_build_test() {
 	done
 
 	if [ "$err" = "0" ] ; then
-		echo_green "DTB build tests passed"
+		__echo_green "DTB build tests passed"
 		return 0
-	fi
-
-	if [ "$hdl_project_tag_err" = "1" ] ; then
-		echo
-		echo
-		echo_green "Some DTs have been found that do not contain an 'hdl_project:' tag"
-		echo_green "   Either:"
-		echo_green "     1. Create a 'hdl_project' tag for it"
-		echo_green "     OR"
-		echo_green "     1. add it in file '$exceptions_file'"
 	fi
 
 	return $err
@@ -427,6 +455,9 @@ __update_git_ref() {
 	local ref="$1"
 	local local_ref="$2"
 	local depth
+
+        [ "${LOCAL_BUILD}" == "y" ] && return 0
+
 	[ "$GIT_FETCH_DEPTH" = "disabled" ] || {
 		depth="--depth=${GIT_FETCH_DEPTH:-50}"
 	}
@@ -441,7 +472,7 @@ __push_back_to_github() {
 	local dst_branch="$1"
 
 	git push --quiet -u $ORIGIN "HEAD:$dst_branch" || {
-		echo_red "Failed to push back '$dst_branch'"
+		__echo_red "Failed to push back '$dst_branch'"
 		return 1
 	}
 }
@@ -451,7 +482,7 @@ MAIN_MIRROR="xcomm_zynq"
 __update_main_mirror() {
 	git checkout "$MAIN_MIRROR"
 	git merge --ff-only ${ORIGIN}/${MAIN_BRANCH} || {
-		echo_red "Failed while syncing ${ORIGIN}/${MAIN_BRANCH} over '$MAIN_MIRROR'"
+		__echo_red "Failed while syncing ${ORIGIN}/${MAIN_BRANCH} over '$MAIN_MIRROR'"
 		return 1
 	}
 
@@ -464,12 +495,12 @@ __handle_sync_with_main() {
 	local cm=$(git log --reverse --oneline ${MAIN_MIRROR}..${MAIN_BRANCH} | awk '{print $1}' | head -1)
 
 	[ -n "$cm" ] || {
-		echo_red "No commits to cherry-pick... Was "${MAIN_MIRROR}" manually updated?!"
+		__echo_red "No commits to cherry-pick... Was "${MAIN_MIRROR}" manually updated?!"
 		return 1
 	}
 
 	__update_git_ref "$dst_branch" || {
-		echo_red "Could not fetch branch '$dst_branch'"
+		__echo_red "Could not fetch branch '$dst_branch'"
 		return 1
 	}
 
@@ -493,8 +524,8 @@ __handle_sync_with_main() {
 			}
 		done
 		if [ "$was_a_merge" != "1" ]; then
-			echo_red "Failed to cherry-pick commits '$cm..${ORIGIN}/${MAIN_BRANCH}'"
-			echo_red "$(cat $tmpfile)"
+			__echo_red "Failed to cherry-pick commits '$cm..${ORIGIN}/${MAIN_BRANCH}'"
+			__echo_red "$(cat $tmpfile)"
 			git cherry-pick --abort
 			return 1
 		fi
@@ -505,17 +536,17 @@ __handle_sync_with_main() {
 
 build_sync_branches_with_main() {
 	GIT_FETCH_DEPTH=50
-	BRANCHES="adi-5.15.0 rpi-5.15.y"
+	BRANCHES="adi-6.1.0 rpi-6.1.y"
 
 	__update_git_ref "$MAIN_BRANCH" "$MAIN_BRANCH" || {
-		echo_red "Could not fetch branch '$MAIN_BRANCH'"
+		__echo_red "Could not fetch branch '$MAIN_BRANCH'"
 		return 1
 	}
 
 	# needed for __handle_sync_with_main() so we can properly get the list
 	# of commits to cherry-pick
 	__update_git_ref "$MAIN_MIRROR" "$MAIN_MIRROR" || {
-		echo_red "Could not fetch branch '$MAIN_MIRROR'"
+		__echo_red "Could not fetch branch '$MAIN_MIRROR'"
 		return 1
 	}
 

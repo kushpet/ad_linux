@@ -81,7 +81,7 @@
 	};
 
 	axi_pwm_gen: axi-pwm-gen@ {
-		compatible = "adi,axi-pwmgen";
+		compatible = "adi,axi-pwmgen-2.00.a";
 		reg = <0x44b00000 0x1000>;
 		label = "ad463x_cnv";
 		#pwm-cells = <2>;
@@ -90,7 +90,7 @@
 	};
 
 	axi_spi_engine: spi@44a00000 {
-		compatible = "adi,axi-spi-engine-1.00.a";
+		compatible = "adi-ex,axi-spi-engine-1.00.a";
 		reg = <0x44a00000 0x1FF>;
 		interrupt-parent = <&intc>;
 		interrupts = <0 56 IRQ_TYPE_LEVEL_HIGH>;
@@ -101,8 +101,8 @@
 		#address-cells = <0x1>;
 		#size-cells = <0x0>;
 
-		ad463x: ad463x@0 {
-			compatible = "adi,ad463x";
+		ad4630_24: ad4630-24@0 {
+			compatible = "adi,ad4630-24";
 			reg = <0>;
 			vdd-supply = <&vref>;
 			vdd_1_8-supply = <&vdd_1_8>;
@@ -111,6 +111,8 @@
 			spi-max-frequency = <80000000>;
 			reset-gpios = <&gpio0 86 GPIO_ACTIVE_LOW>;
 			adi,lane-mode = <1>;
+			adi,clock-mode = <0>;
+			adi,out-data-mode = <0>;
 			adi,spi-trigger;
 			clocks = <&cnv_ext_clk>;
 			clock-names = "trigger_clock";
